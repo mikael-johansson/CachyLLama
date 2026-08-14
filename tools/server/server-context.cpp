@@ -9,6 +9,7 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-request-log.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2322,6 +2323,11 @@ private:
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
+        // queue-wait time for request logging (see server_task::t_arrival_us)
+        if (slot.task->t_arrival_us > 0 && slot.t_start_process_prompt > 0) {
+            res->queue_wait_us = slot.t_start_process_prompt - slot.task->t_arrival_us;
+        }
+
         res->verbose           = slot.task->params.verbose;
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
@@ -2374,6 +2380,11 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+
+        // queue-wait time for request logging (see server_task::t_arrival_us)
+        if (slot.task->t_arrival_us > 0 && slot.t_start_process_prompt > 0) {
+            res->queue_wait_us = slot.t_start_process_prompt - slot.task->t_arrival_us;
+        }
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
@@ -4878,6 +4889,13 @@ server_context_meta server_context::get_meta() const {
 // may have bypass_sleep = true if the task does not use ctx_server
 struct server_res_generator : server_res_spipe {
     server_response_reader rd;
+    // non-null only when --request-logging-dir is set and this response
+    // handles a completion request; see handle_completions_impl(). Owned
+    // here so its destructor (which finalizes the log file if it was never
+    // explicitly finalized, e.g. on client disconnect) runs whenever this
+    // response object is destroyed, regardless of which code path got us
+    // there.
+    std::unique_ptr<server_request_log_writer> req_log;
     server_res_generator(server_queue & queue_tasks, server_response & queue_results, int sleep_idle_seconds, bool bypass_sleep = false)
             : rd(queue_tasks, queue_results, HTTP_POLLING_SECONDS) {
         // fast path in case sleeping is disabled
@@ -4965,6 +4983,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
+            task.t_arrival_us = ggml_time_us();
 
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
@@ -5006,8 +5025,77 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             tasks.push_back(std::move(task));
         }
 
+        // Full request/response disk logging (opt-in, --request-logging-dir).
+        // Written here: after the request is parsed/validated and effective
+        // sampling params are known, but before tasks are handed to the
+        // queue. The response side is hooked via rd.on_result below, which
+        // server_response_reader::next() invokes for every result -- both
+        // the streaming and non-streaming (wait_for_all() calls next()
+        // internally) HTTP paths flow through it, so this one hook covers
+        // both without needing separate code paths.
+        if (params.request_logging_enabled && !tasks.empty()) {
+            try {
+                // prefer a readable SYSTEM:/USER:/ASSISTANT:/TOOL: transcript
+                // built from the original client "messages" (chat endpoints);
+                // fall back to the resolved "prompt" (legacy /completion,
+                // infill, or when there's no messages array to render).
+                std::string prompt_text;
+                try {
+                    const json raw_body_json = json::parse(req.body);
+                    if (raw_body_json.contains("messages") && raw_body_json.at("messages").is_array()) {
+                        prompt_text = server_request_log_render_chat_messages(raw_body_json.at("messages"));
+                    }
+                } catch (const std::exception &) {
+                    // req.body isn't JSON (or has no "messages") -- fall through
+                }
+                if (prompt_text.empty()) {
+                    prompt_text = prompt.is_string() ? prompt.get<std::string>() : prompt.dump(2);
+                }
+
+                const std::string request_id = server_request_log_extract_request_id(req.headers, completion_id);
+                res->req_log = server_request_log_create(params.path_request_log_dir, request_id, prompt_text);
+
+                size_t expected_results = 0;
+                for (const auto & t : tasks) {
+                    expected_results += 1 + t.child_tasks.size();
+                }
+                res->req_log->set_expected_results(expected_results);
+
+                const json model_settings = {
+                    {"model_name",         meta->model_name},
+                    {"model_path",         meta->model_path},
+                    {"slot_n_ctx",         meta->slot_n_ctx},
+                    {"model_n_ctx_train",  meta->model_n_ctx_train},
+                };
+
+                res->req_log->write_header(
+                    request_id,
+                    req.remote_addr,
+                    "POST",
+                    req.path,
+                    json_value(data, "model", std::string()),
+                    meta->model_name,
+                    req.headers,
+                    tasks.front().params.to_json(),
+                    model_settings,
+                    req.body,
+                    prompt_text);
+
+                rd.on_result = [w = res->req_log.get()](const server_task_result_ptr & result) {
+                    w->on_result(result);
+                };
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize request log: %s\n", e.what());
+                res->req_log.reset();
+                rd.on_result = nullptr;
+            }
+        }
+
         rd.post_tasks(std::move(tasks));
     } catch (const std::exception & e) {
+        if (res->req_log) {
+            res->req_log->write_error("invalid_request_error", e.what(), 400);
+        }
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -5029,12 +5117,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         if (!first_user_id.empty()) {
             const int cur = ctx_server.get_active_user_count(first_user_id);
             if (cur >= params.max_concurrent_per_user) {
-                res->error(format_error_response(
+                const std::string msg =
                     "user '" + first_user_id + "' is at the per-user concurrency cap of " +
                     std::to_string(params.max_concurrent_per_user) +
                     " (currently " + std::to_string(cur) + " in-flight). " +
-                    "Retry after in-flight requests complete.",
-                    ERROR_TYPE_RATE_LIMIT));
+                    "Retry after in-flight requests complete.";
+                if (res->req_log) {
+                    res->req_log->write_error("rate_limit_error", msg, 429);
+                }
+                res->error(format_error_response(msg, ERROR_TYPE_RATE_LIMIT));
                 return res;
             }
         }
@@ -5207,6 +5298,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             } catch (const std::exception & e) {
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);
+
+                if (res_this->req_log) {
+                    res_this->req_log->write_error("server_error", e.what(), 500);
+                }
 
                 // terminate on exception
                 return false;
