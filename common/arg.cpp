@@ -3919,6 +3919,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--request-logging-dir"}, "PATH",
+        "Log full request/response transcripts to directory, one file per request\n"
+        "(headers, sampling params, raw body, prompt, response, and a performance\n"
+        "footer; auto-created if not present; default: disabled). Sensitive: logs\n"
+        "headers verbatim (including Authorization) and full prompts/responses.",
+        [](common_params & params, const std::string & value) {
+            params.path_request_log_dir     = value;
+            params.request_logging_enabled  = true;
+            std::error_code ec;
+            std::filesystem::create_directories(value, ec);
+            if (ec) {
+                fprintf(stderr, "warning: failed to create request-logging-dir '%s': %s\n", value.c_str(), ec.message().c_str());
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--log-colors"}, "[on|off|auto]",
         "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
         "'auto' enables colors when output is to a terminal",

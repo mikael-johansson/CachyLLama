@@ -506,6 +506,15 @@ struct common_params {
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
     std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
 
+    // full request/response disk logging (opt-in): one human-readable .log
+    // file per request under path_request_log_dir, containing the full
+    // request (headers, sampling params, raw body, readable prompt), the
+    // response written incrementally as it is generated, and a performance
+    // footer (or an error block + partial footer on failure/cancellation).
+    // see tools/server/server-request-log.h for the writer implementation.
+    bool        request_logging_enabled = false;                                                            // NOLINT
+    std::string path_request_log_dir    = ""; // directory for full request/response logs, empty = disabled // NOLINT
+
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
     bool        save_logits       = false;  // whether to save logits to files                              // NOLINT
