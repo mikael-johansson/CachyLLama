@@ -27,6 +27,8 @@ add_library(${TARGET} STATIC
     server-mcp.h
     server-schema.cpp
     server-schema.h
+    server-request-log.cpp
+    server-request-log.h
 )
 
 if (BUILD_SHARED_LIBS)
