@@ -139,6 +139,13 @@ struct server_task {
     // TODO @ngxson : remove this field and implement a mapping task_id -> idx in the response_reader
     size_t index = 0; // used when there are multiple prompts (batch request)
 
+    // wall-clock time (ggml_time_us()) the task was created on the HTTP
+    // handler thread, before being posted to the task queue. Used together
+    // with server_slot::t_start_process_prompt (set when the slot actually
+    // starts working on it) to compute queue-wait time for request logging.
+    // 0 = unset/unknown.
+    int64_t t_arrival_us = 0;
+
     // explicit, operator-declared user identity. empty = anonymous bucket.
     // validated against ^[a-zA-Z0-9\-_]+$ and <= 512 chars at request time.
     // drives SSD cache routing (u/ namespace) and per-user concurrency cap.
@@ -363,6 +370,11 @@ struct server_task_result_cmpl_final : server_task_result {
     result_timings timings;
     std::string prompt;
 
+    // queue-wait time in microseconds (server_slot::t_start_process_prompt -
+    // server_task::t_arrival_us), -1 = unknown. Not part of to_json() /
+    // the public API response, only used internally by request logging.
+    int64_t queue_wait_us = -1;
+
     bool truncated;
     int32_t n_decoded;
     int32_t n_prompt_tokens;
@@ -436,6 +448,9 @@ struct server_task_result_cmpl_partial : server_task_result {
     int32_t n_decoded;
     int32_t n_prompt_tokens;
     int32_t n_prompt_tokens_cache;
+
+    // see server_task_result_cmpl_final::queue_wait_us
+    int64_t queue_wait_us = -1;
 
     bool post_sampling_probs;
     bool is_progress = false;
