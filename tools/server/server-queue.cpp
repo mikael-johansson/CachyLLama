@@ -398,6 +398,9 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             if (result->is_error()) {
                 stop(); // cancel remaining tasks
                 SRV_DBG("%s", "received error result, stopping further processing\n");
+                if (on_result) {
+                    on_result(result);
+                }
                 return result;
             }
             if (!states.empty()) {
@@ -408,6 +411,9 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
             if (result->is_stop()) {
                 received_count++;
+            }
+            if (on_result) {
+                on_result(result);
             }
             return result;
         }

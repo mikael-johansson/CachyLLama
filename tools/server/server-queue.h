@@ -185,6 +185,15 @@ struct server_response_reader {
     // only used by streaming completions
     std::vector<task_result_state> states;
 
+    // optional observer, invoked from next() for every result (partial,
+    // final, or error) in arrival order, before the result is returned to
+    // the caller. This is the single point both the streaming (rd.next())
+    // and non-streaming (rd.wait_for_all(), which calls next() internally)
+    // HTTP paths flow through, used by the request-logging feature to tap
+    // the response stream without duplicating the read loop. Left unset
+    // (nullptr) by default; never throws (caller's responsibility).
+    std::function<void(const server_task_result_ptr &)> on_result;
+
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
         : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
