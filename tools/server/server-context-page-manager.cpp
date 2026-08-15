@@ -209,7 +209,8 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     size_t tokens_size,
     uint32_t turn_id,
     uint64_t conv_hash,
-    const std::string& user_id
+    const std::string& user_id,
+    double* out_io_ms
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -229,7 +230,7 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
         if (it != checkpoints_.end()) evict_slot_internal(it->first);
     }
 
-    uint64_t ckpt_id = sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id);
+    uint64_t ckpt_id = sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id, out_io_ms);
     if (ckpt_id == 0) return false;
 
     stored_checkpoint sc2;
@@ -479,7 +480,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
     int32_t* out_lcp,
     float* out_overlap,
     bool* out_is_continuation,
-    const std::string& user_id
+    const std::string& user_id,
+    double* out_io_ms
 ) {
     if (!user_id.empty()) {
         // user-scoped cold-start lookups never escape the user's own cache.
@@ -494,7 +496,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
         // Prefetch the checkpoint file from SSD while we prepare to load it.
         sc->prefetch(ckpt_id);
 
-        bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
+        bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id, out_io_ms);
         if (ok) {
             cache_hits_++;
             if (out_lcp) *out_lcp = match_lcp;
@@ -554,7 +556,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     // which differs on cold-start restarts when slots get reused. The KV cells would
     // land under the wrong seq_id, leaving the destination slot's seq_id empty and
     // tripping pos_min == -1 in pre_decode().
-    bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
+    bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id, out_io_ms);
     if (ok) {
         cache_hits_++;
         if (out_lcp) *out_lcp = match_lcp;

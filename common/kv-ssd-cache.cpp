@@ -12,6 +12,7 @@
 #include <cinttypes>
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <filesystem>
 #include <fcntl.h>
@@ -421,7 +422,10 @@ static void make_room_hot(kv_ssd_cache* c, size_t needed) {
 }
 
 // Promote a checkpoint to hot tier (load from SSD file if needed).
-static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
+// out_io_ms, if non-null, receives the wall-clock time (ms) spent in the
+// actual disk read when the checkpoint was cold (0.0 for warm/hot -- no
+// disk I/O in that case).
+static bool promote_to_hot(kv_ssd_cache* c, uint64_t id, double* out_io_ms = nullptr) {
     auto it = c->index.find(id);
     if (it == c->index.end()) return false;
 
@@ -477,6 +481,11 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
     }
 #endif
 
+    // Wall-clock timing for the actual disk read (open..close), separate
+    // from the make_room_hot()/hot-cache bookkeeping that follows -- see
+    // out_io_ms doc comment above.
+    const auto t_io_start = std::chrono::steady_clock::now();
+
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd < 0) {
         LOG_WRN("SSD cache: checkpoint file %s not found\n", filepath.c_str());
@@ -496,7 +505,6 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
     const size_t dft_size  = (size_t)rec.dft_data_size;
     const size_t spec_size = (size_t)rec.spec_data_size;
     const size_t total_blob = tgt_size + dft_size + spec_size;
-    make_room_hot(c, total_blob);
 
     // Read all blobs concatenated: [tgt_data][dft_data][spec_data]
     std::vector<uint8_t> data(total_blob);
@@ -505,6 +513,13 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
         return false;
     }
     close(fd);
+
+    if (out_io_ms) {
+        *out_io_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_io_start).count();
+    }
+
+    make_room_hot(c, total_blob);
 
     // Update index split sizes in case they differed from what was recovered
     ckpt.dft_data_size  = dft_size;
@@ -626,7 +641,8 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   const uint32_t* tokens, size_t tokens_size,
                   uint64_t compat_hash,
                   const uint8_t* dft_data, size_t dft_data_size,
-                  const uint8_t* spec_data, size_t spec_data_size)
+                  const uint8_t* spec_data, size_t spec_data_size,
+                  double* out_io_ms)
 {
     if (!cache || !cache->initialized || !data || data_size == 0) return 0;
 
@@ -660,6 +676,12 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     rec.spec_data_size = (spec_data && spec_data_size > 0) ? spec_data_size : 0;
 
     // Write checkpoint file: [header][tgt_data][dft_data][spec_data]
+    // Wall-clock timing for the actual disk write (open..close, including
+    // fsync when enabled), separate from the record-header construction
+    // above and the index/hot-cache bookkeeping below -- see out_io_ms doc
+    // comment in kv-ssd-cache.h. Respects config.no_fsync: fsync() is only
+    // called (and its cost only included in the timing) when enabled.
+    const auto t_io_start = std::chrono::steady_clock::now();
     std::string filepath = ckpt_path(cache, id);
     int fd = open(filepath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
@@ -705,6 +727,11 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
         fsync(fd);
     }
     close(fd);
+
+    if (out_io_ms) {
+        *out_io_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_io_start).count();
+    }
 
     if (!ok) {
         unlink(filepath.c_str());
@@ -770,7 +797,8 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
 bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
                  std::vector<uint8_t>& out_data,
                  std::vector<uint8_t>* out_dft_data,
-                 std::vector<uint8_t>* out_spec_data)
+                 std::vector<uint8_t>* out_spec_data,
+                 double* out_io_ms)
 {
     if (!cache || !cache->initialized || checkpoint_id == 0) return false;
 
@@ -828,13 +856,13 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
     if (warm_it != cache->warm_cache.end()) {
         auto& ckpt = cache->index[checkpoint_id];
         split_blob(warm_it->second, ckpt);
-        promote_to_hot(cache, checkpoint_id);
+        promote_to_hot(cache, checkpoint_id); // warm->hot, RAM-only, no disk I/O
         cache->stats_hits++;
         return true;
     }
 
     // Load from SSD file and promote to hot
-    if (promote_to_hot(cache, checkpoint_id)) {
+    if (promote_to_hot(cache, checkpoint_id, out_io_ms)) {
         auto it = cache->hot_cache.find(checkpoint_id);
         if (it != cache->hot_cache.end()) {
             auto& ckpt = cache->index[checkpoint_id];

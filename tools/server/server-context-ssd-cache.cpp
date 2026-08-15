@@ -18,7 +18,8 @@ uint64_t server_ssd_cache::store(uint32_t slot_id,
                                  const common_prompt_checkpoint& ckpt,
                                  const llama_token* tokens,
                                  size_t tokens_size,
-                                 uint32_t turn_id)
+                                 uint32_t turn_id,
+                                 double* out_io_ms)
 {
     if (!cache_ || !ctx || !ckpt.data_tgt.data()) return 0;
 
@@ -54,7 +55,8 @@ uint64_t server_ssd_cache::store(uint32_t slot_id,
                         (const uint32_t*)tokens, tokens_size,
                         cache_->compat_hash,
                         dft_data.empty()  ? nullptr : dft_data.data(),  dft_data.size(),
-                        spec_data.empty() ? nullptr : spec_data.data(), spec_data.size());
+                        spec_data.empty() ? nullptr : spec_data.data(), spec_data.size(),
+                        out_io_ms);
 }
 
 bool server_ssd_cache::load(uint64_t checkpoint_id,
@@ -64,7 +66,8 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
                             int32_t& out_pos_max,
                             uint64_t& out_n_tokens,
                             std::vector<uint8_t>* out_spec_data,
-                            uint32_t dest_seq_id)
+                            uint32_t dest_seq_id,
+                            double* out_io_ms)
 {
     if (!cache_ || !ctx || checkpoint_id == 0) return false;
 
@@ -78,7 +81,7 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
     std::vector<uint8_t> tgt_data;
     std::vector<uint8_t> dft_data;
     std::vector<uint8_t> spec_data;
-    if (!kv_ssd_load(cache_, checkpoint_id, tgt_data, &dft_data, &spec_data)) return false;
+    if (!kv_ssd_load(cache_, checkpoint_id, tgt_data, &dft_data, &spec_data, out_io_ms)) return false;
 
     // Restore tgt state (recurrent + KV cache) under the current slot's seq_id
     if (llama_state_seq_set_data_ext(ctx, tgt_data.data(), tgt_data.size(), (int32_t)seq_id, 0) == 0) {

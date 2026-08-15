@@ -31,13 +31,17 @@ public:
     // ctx is used to compute full state (recurrent + KV cache) for SSD storage.
     // ctx_dft is the MTP/draft context (nullptr if not using MTP or if mem-shared).
     // tokens points to llama_token array, tokens_size is count
+    // out_io_ms, if non-null, receives the wall-clock time (ms) of the
+    // underlying disk write (see kv_ssd_store()'s doc comment) -- used by
+    // cache-operations logging, see server-cache-log.h.
     uint64_t store(uint32_t slot_id,
                    struct llama_context* ctx,
                    struct llama_context* ctx_dft,
                    const common_prompt_checkpoint& ckpt,
                    const llama_token* tokens,
                    size_t tokens_size,
-                   uint32_t turn_id);
+                   uint32_t turn_id,
+                   double* out_io_ms = nullptr);
 
     // Load a checkpoint by ID. Restores via llama_state_seq_set_data_ext.
     // ctx_dft receives the MTP/draft context state if it was stored (may be nullptr).
@@ -45,6 +49,9 @@ public:
     // dest_seq_id: sequence ID to restore KV cells under. Pass the CURRENT slot's
     // seq_id here — it may differ from meta->slot_id on cross-slot cold-start restores.
     // Defaults to UINT32_MAX which falls back to meta->slot_id (same-slot case).
+    // out_io_ms, if non-null, receives the wall-clock time (ms) of the
+    // underlying disk read (see kv_ssd_load()'s doc comment); 0.0 when the
+    // checkpoint was served from the hot/warm RAM tier (no disk I/O).
     bool load(uint64_t checkpoint_id,
               struct llama_context* ctx,
               struct llama_context* ctx_dft,
@@ -52,7 +59,8 @@ public:
               int32_t& out_pos_max,
               uint64_t& out_n_tokens,
               std::vector<uint8_t>* out_spec_data = nullptr,
-              uint32_t dest_seq_id = UINT32_MAX);
+              uint32_t dest_seq_id = UINT32_MAX,
+              double* out_io_ms = nullptr);
 
     // Find best matching checkpoint for a token sequence.
     // Searches within this conversation's cache only.

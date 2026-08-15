@@ -157,6 +157,11 @@ void kv_ssd_free(kv_ssd_cache* cache);
 // tokens/tokens_size used for hash-based matching (can be null/0).
 // dft_data/spec_data are optional extra blobs (MTP context and speculative impl state).
 // Returns checkpoint ID (>0) on success, 0 on failure.
+// out_io_ms, if non-null, receives the wall-clock time (ms) spent in the
+// actual file I/O (open/pwrite/fsync/close of the checkpoint file), not
+// counting record-header construction or the in-memory hot-tier bookkeeping
+// that follows it. Left untouched (caller should pre-initialize) if the
+// store fails before I/O is attempted.
 uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   uint32_t slot_id,
                   const uint8_t* data, size_t data_size,
@@ -165,16 +170,22 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
                   const uint32_t* tokens, size_t tokens_size,
                   uint64_t compat_hash = 0,
                   const uint8_t* dft_data = nullptr, size_t dft_data_size = 0,
-                  const uint8_t* spec_data = nullptr, size_t spec_data_size = 0);
+                  const uint8_t* spec_data = nullptr, size_t spec_data_size = 0,
+                  double* out_io_ms = nullptr);
 
 // Load a checkpoint by ID. Reads ckpt-{id}.bin and promotes to hot tier.
 // out_dft_data and out_spec_data receive the optional extra blobs if non-null.
+// out_io_ms, if non-null, receives the wall-clock time (ms) spent reading
+// the checkpoint file from disk. Left at 0.0 when the checkpoint was
+// already resident in the hot or warm RAM tier (no disk I/O occurred) --
+// callers can use "was disk touched" == (*out_io_ms > 0.0).
 // Returns true and copies data to out_data on success.
 bool kv_ssd_load(kv_ssd_cache* cache,
                  uint64_t checkpoint_id,
                  std::vector<uint8_t>& out_data,
                  std::vector<uint8_t>* out_dft_data = nullptr,
-                 std::vector<uint8_t>* out_spec_data = nullptr);
+                 std::vector<uint8_t>* out_spec_data = nullptr,
+                 double* out_io_ms = nullptr);
 
 // Find best matching checkpoint by token prefix comparison.
 // Searches within this conversation's cache only.

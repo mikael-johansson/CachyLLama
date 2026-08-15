@@ -64,6 +64,10 @@ public:
     // Creates the conversation directory automatically on first use.
     // ctx is required to compute full state (recurrent + KV cache) for SSD storage.
     // ctx_dft is the MTP/draft context (nullptr if none or mem-shared).
+    // out_io_ms, if non-null, receives the wall-clock time (ms) of the
+    // underlying SSD disk write -- used by cache-operations logging (see
+    // server-cache-log.h and REQUEST_LOGGING_SPEC.md's cache-operations
+    // design).
     bool store_checkpoint_with_tokens(
         uint32_t slot_id,
         struct llama_context* ctx,
@@ -73,7 +77,8 @@ public:
         size_t tokens_size,
         uint32_t turn_id,
         uint64_t conv_hash = 0,
-        const std::string& user_id = std::string()
+        const std::string& user_id = std::string(),
+        double* out_io_ms = nullptr
     );
 
     // Load a checkpoint back to slot memory
@@ -128,6 +133,9 @@ public:
     // across all conversation directories if conv_hash isn't known yet.
     // dest_seq_id: current slot's seq_id — KV cells are restored under this id so that
     // llama_memory_seq_pos_min() returns a valid value for the slot after restore.
+    // out_io_ms, if non-null, receives the wall-clock time (ms) of the
+    // underlying SSD disk read; 0.0 when the checkpoint was served from the
+    // hot/warm RAM tier (no disk I/O) -- used by cache-operations logging.
     bool find_and_load_checkpoint(
         const llama_token* tokens,
         size_t tokens_size,
@@ -145,7 +153,8 @@ public:
         int32_t* out_lcp = nullptr,
         float* out_overlap = nullptr,
         bool* out_is_continuation = nullptr,
-        const std::string& user_id = std::string()
+        const std::string& user_id = std::string(),
+        double* out_io_ms = nullptr
     );
 
    // Evict all checkpoints for a specific slot
