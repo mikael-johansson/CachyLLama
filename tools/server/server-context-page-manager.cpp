@@ -9,8 +9,10 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <system_error>
@@ -27,6 +29,52 @@ static uint64_t fnv1a_string(const std::string & s) {
         h *= 1099511628211ULL;
     }
     return h;
+}
+
+// Directory last-write-time as a time_t. Used to order on-disk conversation
+// directories oldest-first for eviction.
+static time_t dir_mtime(const fs::path& dir) {
+    std::error_code ec;
+    auto ftime = fs::last_write_time(dir, ec);
+    if (ec) return 0;
+    return std::chrono::system_clock::to_time_t(
+        std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
+}
+
+// Recursive sum of regular-file sizes under dir. Per-file errors (a file
+// disappearing mid-scan due to concurrent eviction/writes, permission
+// issues, etc.) are skipped rather than aborting the whole walk.
+static size_t dir_bytes_recursive(const fs::path& dir) {
+    size_t total = 0;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(
+        dir, fs::directory_options::skip_permission_denied, ec);
+    if (ec) return 0;
+    fs::recursive_directory_iterator end;
+    while (it != end) {
+        std::error_code file_ec;
+        if (it->is_regular_file(file_ec) && !file_ec) {
+            std::error_code size_ec;
+            size_t sz = (size_t) it->file_size(size_ec);
+            if (!size_ec) total += sz;
+        }
+        std::error_code inc_ec;
+        it.increment(inc_ec);
+        if (inc_ec) break;
+    }
+    return total;
+}
+
+// True iff name is exactly 16 lowercase/uppercase hex characters -- the
+// on-disk naming convention for conversation and user-cache directories
+// (see server_context_page_manager::scan_on_disk_conversations_locked).
+static bool is_hex16(const std::string& name) {
+    if (name.size() != 16) return false;
+    for (char c : name) {
+        if (!std::isxdigit((unsigned char) c)) return false;
+    }
+    return true;
 }
 
 server_context_page_manager::server_context_page_manager(
@@ -108,6 +156,42 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
             (unsigned long)h, cache_type_k, cache_type_v);
 }
 
+std::vector<server_context_page_manager::on_disk_conv>
+server_context_page_manager::scan_on_disk_conversations_locked(bool with_bytes) const {
+    std::vector<on_disk_conv> result;
+
+    auto scan_namespace = [&](const fs::path& base, bool is_user) {
+        std::error_code ec;
+        if (!fs::exists(base, ec) || ec) return;
+
+        for (fs::directory_iterator dit(base, ec), end; !ec && dit != end; dit.increment(ec)) {
+            std::error_code dir_ec;
+            if (!dit->is_directory(dir_ec) || dir_ec) continue;
+
+            std::string name = dit->path().filename().string();
+            if (!is_hex16(name)) continue;
+
+            errno = 0;
+            char* endp = nullptr;
+            uint64_t key = std::strtoull(name.c_str(), &endp, 16);
+            if (endp != name.c_str() + name.size() || errno == ERANGE) continue;
+
+            on_disk_conv c;
+            c.key     = key;
+            c.is_user = is_user;
+            c.dir     = dit->path().string();
+            c.mtime   = dir_mtime(dit->path());
+            c.bytes   = with_bytes ? dir_bytes_recursive(dit->path()) : 0;
+            result.push_back(std::move(c));
+        }
+    };
+
+    scan_namespace(fs::path(ssd_base_path_), false);
+    scan_namespace(fs::path(ssd_base_path_) / "u", true);
+
+    return result;
+}
+
 server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv_hash) {
     if (conv_hash == 0) return nullptr;
 
@@ -116,42 +200,49 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
         return it->second.get();
     }
 
-    // Evict oldest conversation if at max
-    if ((int)conv_caches_.size() >= max_conversations) {
+    // Evict the oldest anonymous conversation directory if the on-disk count
+    // (not just conv_caches_, which only reflects conversations touched
+    // during this process's lifetime) is at or above max_conversations. This
+    // makes the cap correct across server restarts: a directory left behind
+    // by a previous process instance is still counted, and still evictable.
+    auto on_disk = scan_on_disk_conversations_locked(/*with_bytes=*/false);
+
+    size_t anon_count = 0;
+    for (const auto& c : on_disk) {
+        if (!c.is_user) anon_count++;
+    }
+
+    if ((int)anon_count >= max_conversations) {
         uint64_t oldest_conv = 0;
         time_t oldest_mtime = 0;
+        bool found = false;
 
-        for (const auto& [cv, cache] : conv_caches_) {
-            char hex[17];
-            snprintf(hex, sizeof(hex), "%016lx", (unsigned long)cv);
-            fs::path dir = fs::path(ssd_base_path_) / hex;
-
-            std::error_code ec;
-            auto ftime = fs::last_write_time(dir, ec);
-            if (!ec) {
-                auto mtime = std::chrono::system_clock::to_time_t(
-                    std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
-                if (oldest_conv == 0 || mtime < oldest_mtime) {
-                    oldest_mtime = mtime;
-                    oldest_conv = cv;
-                }
+        for (const auto& c : on_disk) {
+            if (c.is_user) continue;
+            if (!found || c.mtime < oldest_mtime) {
+                oldest_mtime = c.mtime;
+                oldest_conv = c.key;
+                found = true;
             }
         }
 
-        if (oldest_conv != 0) {
+        if (found) {
             LOG_WRN("SSD cache: evicting conversation %016lx (max=%d reached)\n",
                      (unsigned long)oldest_conv, max_conversations);
 
-            // Delete conversation directory and all its files
+            // Delete conversation directory and all its files. This works
+            // whether or not the conversation was ever loaded into
+            // conv_caches_/conv_wrappers_ this run.
             char hex[17];
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest_conv);
             fs::path dir = fs::path(ssd_base_path_) / hex;
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                std::error_code rm_ec;
+                fs::remove(entry.path(), rm_ec);
             }
-            fs::remove(dir);
+            fs::remove(dir, ec);
 
             conv_wrappers_.erase(oldest_conv);
             conv_caches_.erase(oldest_conv);
@@ -637,32 +728,34 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
         return it->second.get();
     }
 
-    // Evict oldest user cache if at max. share the max_conversations cap
-    // with the anonymous bucket so the total SSD directory count stays
-    // bounded.
-    if ((int)user_caches_.size() >= max_conversations) {
+    // Evict oldest user cache if the on-disk count is at max. Shares the
+    // max_conversations cap with the anonymous bucket so the total SSD
+    // directory count stays bounded. Uses the same on-disk scan as
+    // get_or_create_cache so this cap is correct across restarts too: a
+    // user-cache directory left by a previous process instance would
+    // otherwise never be counted or evicted (see scan_on_disk_conversations_locked).
+    auto on_disk = scan_on_disk_conversations_locked(/*with_bytes=*/false);
+
+    size_t user_count = 0;
+    for (const auto& c : on_disk) {
+        if (c.is_user) user_count++;
+    }
+
+    if ((int)user_count >= max_conversations) {
         uint64_t oldest = 0;
         time_t oldest_mtime = 0;
+        bool found = false;
 
-        for (const auto& [uk, cache] : user_caches_) {
-            char hex[17];
-            snprintf(hex, sizeof(hex), "%016lx", (unsigned long)uk);
-            fs::path dir = fs::path(ssd_base_path_) / "u" / hex;
-
-            std::error_code ec;
-            auto ftime = fs::last_write_time(dir, ec);
-            if (!ec) {
-                auto mtime = std::chrono::system_clock::to_time_t(
-                    std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
-                if (oldest == 0 || mtime < oldest_mtime) {
-                    oldest_mtime = mtime;
-                    oldest = uk;
-                }
+        for (const auto& c : on_disk) {
+            if (!c.is_user) continue;
+            if (!found || c.mtime < oldest_mtime) {
+                oldest_mtime = c.mtime;
+                oldest = c.key;
+                found = true;
             }
         }
 
-        if (oldest != 0) {
+        if (found) {
             LOG_WRN("SSD cache: evicting user %016lx (max=%d reached)\n",
                      (unsigned long)oldest, max_conversations);
 
@@ -670,10 +763,12 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest);
             fs::path dir = fs::path(ssd_base_path_) / "u" / hex;
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                std::error_code rm_ec;
+                fs::remove(entry.path(), rm_ec);
             }
-            fs::remove(dir);
+            fs::remove(dir, ec);
 
             user_wrappers_.erase(oldest);
             user_caches_.erase(oldest);
@@ -709,26 +804,17 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
 namespace llama {
 
 size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
-    auto sum_cache_bytes = [](const kv_ssd_cache* cache) -> size_t {
-        if (!cache) return 0;
-        size_t total = 0;
-        // Index holds cold entries until they're ring-buffer-evicted or
-        // explicitly deleted. Hot/warm entries also stay in the index,
-        // so filter by tier to avoid double-counting RAM blobs as SSD usage.
-        for (const auto& [id, ckpt] : cache->index) {
-            if (ckpt.tier == KV_TIER_COLD) {
-                total += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
-            }
-        }
-        return total;
-    };
-
+    // Real on-disk cold-tier usage, summed straight from the filesystem
+    // rather than from conv_caches_/user_caches_' in-memory indexes. The
+    // in-memory indexes only know about conversations this process has
+    // touched, so summing them silently ignores every directory left behind
+    // by a previous server instance -- exactly the bug --cache-ssd-cold-maxsize
+    // was supposed to prevent. Directory bytes are a reasonable proxy for
+    // "cold tier size": hot/warm data lives in RAM, not on disk, so
+    // everything a directory scan finds on disk is by construction cold.
     size_t total = 0;
-    for (const auto& [conv, cache] : conv_caches_) {
-        total += sum_cache_bytes(cache.get());
-    }
-    for (const auto& [key, cache] : user_caches_) {
-        total += sum_cache_bytes(cache.get());
+    for (const auto& c : scan_on_disk_conversations_locked(/*with_bytes=*/true)) {
+        total += c.bytes;
     }
     return total;
 }
@@ -736,78 +822,34 @@ size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
 void server_context_page_manager::evict_conversations_for_size_locked() {
     if (cold_max_size_bytes == 0) return;
 
-    size_t total = compute_cold_total_bytes_locked();
+    // Single scan serves both the total-bytes check and the eviction
+    // candidate list, instead of compute_cold_total_bytes_locked() doing its
+    // own scan and this function doing a second one.
+    auto on_disk = scan_on_disk_conversations_locked(/*with_bytes=*/true);
+
+    size_t total = 0;
+    for (const auto& c : on_disk) total += c.bytes;
     if (total <= cold_max_size_bytes) return;
 
-    // Build the eviction candidate list: (mtime, namespace, key).
-    // Anonymous caches live directly under ssd_base_path_; user caches live
-    // under ssd_base_path_/u/. We scan both namespaces together so a single
-    // conversation is one candidate regardless of where it lives on disk.
-    struct candidate {
-        time_t mtime;
-        bool is_user;
-        uint64_t key;
-    };
-    std::vector<candidate> candidates;
-
-    auto mtime_for = [](const fs::path& dir) -> time_t {
-        std::error_code ec;
-        auto ftime = fs::last_write_time(dir, ec);
-        if (ec) return 0;
-        return std::chrono::system_clock::to_time_t(
-            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
-    };
-
-    candidates.reserve(conv_caches_.size() + user_caches_.size());
-    for (const auto& conv_pair : conv_caches_) {
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)conv_pair.first);
-        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / hex), false, conv_pair.first });
-    }
-    for (const auto& user_pair : user_caches_) {
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)user_pair.first);
-        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / "u" / hex), true, user_pair.first });
-    }
-
     // Oldest first - matches the existing --cache-ssd-max-conversations
-    // behavior so the two caps evict consistently.
+    // behavior so the two caps evict consistently. Anonymous and
+    // user-scoped directories are ordered together so a single
+    // conversation is one candidate regardless of where it lives on disk.
+    std::vector<on_disk_conv> candidates = std::move(on_disk);
     std::sort(candidates.begin(), candidates.end(),
-        [](const candidate& a, const candidate& b) { return a.mtime < b.mtime; });
+        [](const on_disk_conv& a, const on_disk_conv& b) { return a.mtime < b.mtime; });
 
     size_t evicted = 0;
     for (const auto& c : candidates) {
         if (total <= cold_max_size_bytes) break;
 
-        char hex[17];
-        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)c.key);
-        fs::path dir = c.is_user
-            ? fs::path(ssd_base_path_) / "u" / hex
-            : fs::path(ssd_base_path_) / hex;
+        fs::path dir = c.dir;
 
-        // Measure this conversation's contribution before deleting so the log
-        // line tells the user how much disk was actually reclaimed.
-        size_t freed = 0;
-        if (c.is_user) {
-            auto it = user_caches_.find(c.key);
-            if (it != user_caches_.end()) {
-                for (const auto& [id, ckpt] : it->second->index) {
-                    if (ckpt.tier == KV_TIER_COLD) {
-                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
-                    }
-                }
-            }
-        } else {
-            auto it = conv_caches_.find(c.key);
-            if (it != conv_caches_.end()) {
-                for (const auto& [id, ckpt] : it->second->index) {
-                    if (ckpt.tier == KV_TIER_COLD) {
-                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
-                    }
-                }
-            }
-        }
+        // The scan already measured this directory's on-disk size, so use
+        // that directly instead of re-deriving it from the in-memory index
+        // (which may not even have an entry if this conversation was never
+        // loaded this run).
+        size_t freed = c.bytes;
 
         std::error_code ec;
         for (const auto& entry : fs::directory_iterator(dir, ec)) {

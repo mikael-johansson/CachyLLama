@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <ctime>
 
 namespace llama {
 
@@ -222,6 +223,55 @@ private:
     // can be evicted. Logs each evicted directory. No-op when cap is 0.
     // Caller must hold mutex_.
     void evict_conversations_for_size_locked();
+
+    // A conversation or user-scoped cache directory discovered on disk under
+    // ssd_base_path_ (anonymous) or ssd_base_path_/u/ (user-scoped). This is
+    // the source of truth for cap enforcement -- unlike conv_caches_/
+    // user_caches_, which only know about conversations touched during this
+    // process's lifetime, a directory scan also finds conversations created
+    // by a previous server instance (see scan_on_disk_conversations_locked).
+    struct on_disk_conv {
+        uint64_t    key;      // conv_hash, or fnv1a(user_id) for user-scoped
+        bool        is_user;  // true if found under ssd_base_path_/u/
+        std::string dir;      // full path to the conversation directory
+        time_t      mtime;    // directory last-write-time (oldest-first eviction order)
+        size_t      bytes;    // recursive sum of regular-file sizes under dir; only
+                               // populated when scan_on_disk_conversations_locked is
+                               // called with with_bytes=true (see below)
+    };
+
+    // Scan ssd_base_path_ and ssd_base_path_/u/ for conversation/user-cache
+    // directories, i.e. entries whose name is exactly 16 hex characters (the
+    // on-disk conv_hash/user-key naming convention). This makes cap
+    // enforcement correct across server restarts: conv_caches_/user_caches_
+    // are populated lazily and only for conversations this process has
+    // touched, so a directory left over from a previous run would otherwise
+    // never be counted or evicted.
+    //
+    // Entries that aren't exactly 16 hex chars are skipped. That excludes
+    // "u" itself, "lost+found", and the sys-<hash16>.bin system-prompt-cache
+    // *files* (common/kv-ssd-system-cache.*) -- those aren't directories at
+    // all, so the is_directory() check alone would already screen them out,
+    // but the hex-name check is kept as an independent second guard.
+    //
+    // with_bytes controls whether the (potentially expensive) recursive
+    // per-directory byte total is computed; pass false when only counts/
+    // mtimes are needed (max_conversations enforcement) to avoid walking
+    // every file in every conversation directory just to pick an eviction
+    // candidate.
+    //
+    // Lock discipline / cost tradeoff: callers hold mutex_ while calling
+    // this (see get_or_create_cache, get_or_create_user_cache,
+    // evict_conversations_for_size_locked), so the scan -- including the
+    // recursive byte walk when requested -- runs while the lock that gates
+    // all cache reads/writes is held. This is accepted because these call
+    // sites run once per *new* conversation or once per checkpoint store,
+    // never per-token, and directory counts are now bounded by the very
+    // caps this function makes correct. If this ever shows up as real
+    // contention (e.g. very large per-conversation trees, or a network
+    // filesystem backing the cache dir), the fix would be to compute/cache
+    // byte totals with a short TTL instead of rescanning on every call.
+    std::vector<on_disk_conv> scan_on_disk_conversations_locked(bool with_bytes) const;
 
     // Per-conversation caches (conv_hash -> cache instance)
     std::string ssd_base_path_;
