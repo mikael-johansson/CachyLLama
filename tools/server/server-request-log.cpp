@@ -268,7 +268,7 @@ public:
 
             t_start_ = std::chrono::steady_clock::now();
 
-            ofs_ << "=== CACHYLLAMA REQUEST LOG ===\n";
+            ofs_ << "\n=== CACHYLLAMA REQUEST LOG ===\n";
             ofs_ << "timestamp: "    << iso8601_utc(std::chrono::system_clock::now(), false) << "\n";
             ofs_ << "request_id: "   << request_id << "\n";
             ofs_ << "client: "       << (client_addr.empty() ? "unknown" : client_addr) << "\n";
