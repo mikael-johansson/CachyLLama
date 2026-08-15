@@ -119,6 +119,10 @@ class ServerProcess:
     mcp_servers_config: str | None = None
     mcp_servers_json: str | None = None
     cors_origins: str | None = None
+    cache_ssd_path: str | None = None
+    cache_ssd_max_conversations: int | None = None
+    cache_ssd_cold_maxsize: int | None = None
+    cache_ssd_no_fsync: bool = False
 
     # session variables
     process: subprocess.Popen | None = None
@@ -276,6 +280,14 @@ class ServerProcess:
             server_args.extend(["--mcp-servers-json", self.mcp_servers_json])
         if self.backend_sampling:
             server_args.append("--backend_sampling")
+        if self.cache_ssd_path:
+            server_args.extend(["--cache-ssd", self.cache_ssd_path])
+        if self.cache_ssd_max_conversations is not None:
+            server_args.extend(["--cache-ssd-max-conversations", self.cache_ssd_max_conversations])
+        if self.cache_ssd_cold_maxsize is not None:
+            server_args.extend(["--cache-ssd-cold-maxsize", self.cache_ssd_cold_maxsize])
+        if self.cache_ssd_no_fsync:
+            server_args.append("--cache-ssd-no-fsync")
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
 
