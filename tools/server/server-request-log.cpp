@@ -11,6 +11,8 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -445,22 +447,45 @@ private:
         return f;
     }
 
+    // Renders an aligned (label, value-with-unit) table -- see
+    // REQUEST_LOGGING_SPEC.md Part 1 "File format": the label column is
+    // left-justified to the width of the longest *included* label in this
+    // particular footer (recomputed per call, since which optional rows are
+    // present varies between the success footer and the partial-on-error
+    // footer), values always carry their unit inline. Rows for uncomputable
+    // fields are simply not appended -- never fake a value that wasn't
+    // actually measured.
     void write_footer_block(const std::string & label, const footer_data & f) {
-        ofs_ << "\n=== " << label << " ===\n";
-        if (f.prompt_tokens)     { ofs_ << "prompt_tokens: "     << *f.prompt_tokens << "\n"; }
-        if (f.completion_tokens) { ofs_ << "completion_tokens: " << *f.completion_tokens << "\n"; }
-        if (f.cached_tokens)     { ofs_ << "cached_tokens: "     << *f.cached_tokens << "\n"; }
-        if (f.cached_tokens && f.prompt_tokens && *f.prompt_tokens > 0) {
-            const double ratio = 100.0 * static_cast<double>(*f.cached_tokens) / static_cast<double>(*f.prompt_tokens);
-            ofs_ << "cache_hit_ratio: " << fmt_fixed(ratio, 1) << "%\n";
+        std::vector<std::pair<std::string, std::string>> rows;
+
+        if (f.prompt_tokens)     { rows.emplace_back("Prompt tokens", std::to_string(*f.prompt_tokens)); }
+        if (f.completion_tokens) { rows.emplace_back("Completion tokens", std::to_string(*f.completion_tokens)); }
+        if (f.cached_tokens) {
+            std::string value = std::to_string(*f.cached_tokens);
+            if (f.prompt_tokens && *f.prompt_tokens > 0) {
+                const double ratio = 100.0 * static_cast<double>(*f.cached_tokens) / static_cast<double>(*f.prompt_tokens);
+                value += " (" + fmt_fixed(ratio, 1) + "%)";
+            }
+            rows.emplace_back("Cached tokens", value);
         }
-        if (f.pp_tokens_per_sec)       { ofs_ << "pp_tokens_per_sec: "       << fmt_fixed(*f.pp_tokens_per_sec, 2) << "\n"; }
-        if (f.tg_tokens_per_sec)       { ofs_ << "tg_tokens_per_sec: "       << fmt_fixed(*f.tg_tokens_per_sec, 2) << "\n"; }
-        if (f.ttft_sec)                { ofs_ << "ttft_sec: "                << fmt_fixed(*f.ttft_sec, 3) << "\n"; }
-        if (f.prefill_duration_sec)    { ofs_ << "prefill_duration_sec: "    << fmt_fixed(*f.prefill_duration_sec, 3) << "\n"; }
-        if (f.generation_duration_sec) { ofs_ << "generation_duration_sec: " << fmt_fixed(*f.generation_duration_sec, 3) << "\n"; }
-        if (f.total_duration_sec)      { ofs_ << "total_duration_sec: "      << fmt_fixed(*f.total_duration_sec, 3) << "\n"; }
-        if (f.queue_wait_sec)          { ofs_ << "queue_wait_sec: "          << fmt_fixed(*f.queue_wait_sec, 3) << "\n"; }
+        if (f.pp_tokens_per_sec)       { rows.emplace_back("Prefill speed (PP)",    fmt_fixed(*f.pp_tokens_per_sec, 2) + " tok/s"); }
+        if (f.tg_tokens_per_sec)       { rows.emplace_back("Generation speed (TG)", fmt_fixed(*f.tg_tokens_per_sec, 2) + " tok/s"); }
+        if (f.ttft_sec)                { rows.emplace_back("Time to first token",   fmt_fixed(*f.ttft_sec, 3) + " s"); }
+        if (f.prefill_duration_sec)    { rows.emplace_back("Prefill duration",      fmt_fixed(*f.prefill_duration_sec, 3) + " s"); }
+        if (f.generation_duration_sec) { rows.emplace_back("Generation duration",   fmt_fixed(*f.generation_duration_sec, 3) + " s"); }
+        if (f.total_duration_sec)      { rows.emplace_back("Total duration",        fmt_fixed(*f.total_duration_sec, 3) + " s"); }
+        if (f.queue_wait_sec)          { rows.emplace_back("Queue wait",            fmt_fixed(*f.queue_wait_sec, 3) + " s"); }
+
+        ofs_ << "\n=== " << label << " ===\n";
+        if (!rows.empty()) {
+            size_t width = 0;
+            for (const auto & row : rows) {
+                width = std::max(width, row.first.size());
+            }
+            for (const auto & row : rows) {
+                ofs_ << std::left << std::setw(static_cast<int>(width)) << row.first << " : " << row.second << "\n";
+            }
+        }
         ofs_.flush();
     }
 
