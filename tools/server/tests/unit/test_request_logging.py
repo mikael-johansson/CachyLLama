@@ -45,6 +45,21 @@ def wait_for_marker(path: str, marker: str, timeout: float = 10.0):
     raise TimeoutError(f"'{marker}' never appeared in {path} (last content:\n{content})")
 
 
+def parse_footer_rows(footer_text: str) -> dict[str, str]:
+    """Parse the aligned "Label : value" table written by write_footer_block()
+    into a {label: value} dict. Labels are stripped of the alignment padding;
+    matching is done by exact label text, so callers don't need to know (or
+    re-derive) the column width, which varies per call depending on which
+    optional rows are present.
+    """
+    rows = {}
+    for line in footer_text.splitlines():
+        if " : " in line:
+            label, _, value = line.partition(" : ")
+            rows[label.strip()] = value.strip()
+    return rows
+
+
 def test_request_logging_disabled_by_default(tmp_path):
     # request_logging_dir is NOT set -- no --request-logging-dir flag is
     # passed to the server, so no directory / files should ever appear.
@@ -92,12 +107,15 @@ def test_request_logging_non_streaming_completion(tmp_path):
     # separate atomic code path (see spec Part 3 "The good news").
     assert "=== RESPONSE (streaming) ===" in content
 
-    # performance footer with plausible, non-zero values
-    assert "prompt_tokens: " in content
-    assert "completion_tokens: 8" in content
-    for line in content.splitlines():
-        if line.startswith("completion_tokens:"):
-            assert int(line.split(":")[1].strip()) == 8
+    # performance footer: aligned "Label : value-with-unit" table (see
+    # REQUEST_LOGGING_SPEC.md Part 1 "File format"), with plausible,
+    # non-zero values
+    footer = content.split("=== PERFORMANCE ===", 1)[1]
+    rows = parse_footer_rows(footer)
+    assert "Prompt tokens" in rows
+    assert rows["Completion tokens"] == "8"
+    assert "tok/s" in rows.get("Prefill speed (PP)", "") or "tok/s" in rows.get("Generation speed (TG)", "")
+    assert rows["Total duration"].endswith(" s")
 
 
 def test_request_logging_streaming_completion(tmp_path):
@@ -153,6 +171,71 @@ def test_request_logging_chat_completion_renders_transcript(tmp_path):
     assert "Hello there" in prompt_section
 
 
+def test_request_logging_forced_thinking_shows_think_opener(tmp_path):
+    # Reasoning-model chat templates often append an opening "<think>" to the
+    # end of the rendered prompt, forcing the model straight into its
+    # reasoning phase -- the model's own generated tokens then never include
+    # that opening tag (only the matching close), which would otherwise make
+    # the log read like a truncated response (see
+    # REQUEST_LOGGING_SPEC.md's "Reasoning-model <think> prefix" section).
+    #
+    # DeepSeek-R1-Distill's real chat template is a genuine example of this:
+    # test_template.py's test_reasoning() asserts its rendered prompt ends in
+    # "<think>\n" with reasoning="on"/"auto". Reused here (against tinyllama2,
+    # which can't produce coherent reasoning but exercises the exact same
+    # write_header()/generation_prompt detection path) so this doesn't need
+    # the full reasoning-capable model to verify the logging behavior.
+    global server
+    req_dir = str(tmp_path / "requests")
+    server.request_logging_dir = req_dir
+    server.jinja = True
+    server.reasoning = "on"
+    server.chat_template_file = '../../../models/templates/deepseek-ai-DeepSeek-R1-Distill-Qwen-32B.jinja'
+    server.start()
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "max_tokens": 8,
+        "messages": [
+            {"role": "user", "content": "Hello there"},
+        ],
+    }, headers={"X-Request-Id": "test-thinking-005"})
+    assert res.status_code == 200
+
+    path = wait_for_log_file(req_dir)
+    content = wait_for_marker(path, "=== PERFORMANCE ===")
+
+    response_section = content.split("=== RESPONSE (streaming) ===\n", 1)[1]
+    response_section = response_section.split("\n=== PERFORMANCE", 1)[0]
+    assert response_section.startswith("<think>\n"), \
+        f"expected response section to start with a synthetic '<think>' opener, got:\n{response_section[:200]!r}"
+    # exactly one opener -- never duplicated with anything the model itself emits
+    assert response_section.count("<think>") == 1
+
+
+def test_request_logging_no_forced_thinking_no_think_opener(tmp_path):
+    # Control for the test above: a plain (non-reasoning) request must NOT
+    # get a synthetic "<think>" prefix.
+    global server
+    req_dir = str(tmp_path / "requests")
+    server.request_logging_dir = req_dir
+    server.start()
+
+    res = server.make_request("POST", "/v1/chat/completions", data={
+        "max_tokens": 8,
+        "messages": [
+            {"role": "user", "content": "Hello there"},
+        ],
+    }, headers={"X-Request-Id": "test-no-thinking-006"})
+    assert res.status_code == 200
+
+    path = wait_for_log_file(req_dir)
+    content = wait_for_marker(path, "=== PERFORMANCE ===")
+
+    response_section = content.split("=== RESPONSE (streaming) ===\n", 1)[1]
+    response_section = response_section.split("\n=== PERFORMANCE", 1)[0]
+    assert not response_section.startswith("<think>\n")
+
+
 def test_request_logging_disconnect_leaves_partial_footer(tmp_path):
     # This is the regression test for the ordering concern called out in the
     # porting spec ("must verify before shipping"): when a request is
@@ -194,15 +277,11 @@ def test_request_logging_disconnect_leaves_partial_footer(tmp_path):
     assert "=== CANCELLED ===" in content or "=== ERROR ===" in content
 
     footer = content.split("=== PERFORMANCE (partial) ===", 1)[1]
-    completion_tokens = None
-    for line in footer.splitlines():
-        if line.startswith("completion_tokens:"):
-            completion_tokens = int(line.split(":")[1].strip())
-            break
-    assert completion_tokens is not None, f"no completion_tokens line in partial footer:\n{footer}"
+    rows = parse_footer_rows(footer)
+    assert "Completion tokens" in rows, f"no 'Completion tokens' row in partial footer:\n{footer}"
     # the critical assertion: real partial progress, not zeroed out by the
     # terminal cancellation event
-    assert completion_tokens > 0
+    assert int(rows["Completion tokens"]) > 0
 
     # the response section should also contain real generated text, not be
     # empty (independent corroboration of the same ordering property)
