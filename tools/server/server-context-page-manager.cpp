@@ -301,7 +301,8 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     uint32_t turn_id,
     uint64_t conv_hash,
     const std::string& user_id,
-    double* out_io_ms
+    double* out_io_ms,
+    uint64_t* out_checkpoint_id
 ) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
@@ -323,6 +324,8 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
 
     uint64_t ckpt_id = sc->store(slot_id, ctx, ctx_dft, ckpt, tokens, tokens_size, turn_id, out_io_ms);
     if (ckpt_id == 0) return false;
+
+    if (out_checkpoint_id) *out_checkpoint_id = ckpt_id;
 
     stored_checkpoint sc2;
     sc2.checkpoint_id = ckpt_id;
@@ -572,7 +575,9 @@ bool server_context_page_manager::find_and_load_checkpoint(
     float* out_overlap,
     bool* out_is_continuation,
     const std::string& user_id,
-    double* out_io_ms
+    double* out_io_ms,
+    uint64_t* out_checkpoint_id,
+    bool* out_had_candidate
 ) {
     if (!user_id.empty()) {
         // user-scoped cold-start lookups never escape the user's own cache.
@@ -583,6 +588,13 @@ bool server_context_page_manager::find_and_load_checkpoint(
         int32_t match_lcp = 0;
         uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
         if (ckpt_id == 0) { cache_misses_++; return false; }
+
+        if (out_had_candidate) *out_had_candidate = true;
+        // Set as soon as a candidate is found (not only on load success) so
+        // a failed-load caller can still report which checkpoint id it
+        // attempted (see find_and_load_checkpoint()'s out_had_candidate doc
+        // comment / the ssd_restore_failed narrative log in server-context.cpp).
+        if (out_checkpoint_id) *out_checkpoint_id = ckpt_id;
 
         // Prefetch the checkpoint file from SSD while we prepare to load it.
         sc->prefetch(ckpt_id);
@@ -635,6 +647,13 @@ bool server_context_page_manager::find_and_load_checkpoint(
         cache_misses_++;
         return false;
     }
+
+    if (out_had_candidate) *out_had_candidate = true;
+    // Set as soon as a candidate is found (not only on load success) so a
+    // failed-load caller can still report which checkpoint id it attempted
+    // (see find_and_load_checkpoint()'s out_had_candidate doc comment / the
+    // ssd_restore_failed narrative log in server-context.cpp).
+    if (out_checkpoint_id) *out_checkpoint_id = ckpt_id;
 
     // Prefetch the checkpoint file from SSD while we prepare to load it.
     // This triggers kernel page cache readahead so the SSD I/O overlaps

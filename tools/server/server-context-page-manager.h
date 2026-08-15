@@ -69,6 +69,12 @@ public:
     // underlying SSD disk write -- used by cache-operations logging (see
     // server-cache-log.h and REQUEST_LOGGING_SPEC.md's cache-operations
     // design).
+    // out_checkpoint_id, if non-null, receives the kv_ssd_cache checkpoint
+    // id assigned to this store (the same id sc->store() returns
+    // internally, previously discarded here) -- used by the narrative
+    // "[Conversation ...] ... snapshot <id> on DISK" live server log line
+    // (see server_cache_event::snapshot_id in server-cache-log.h). Left
+    // untouched when the store fails.
     bool store_checkpoint_with_tokens(
         uint32_t slot_id,
         struct llama_context* ctx,
@@ -79,7 +85,8 @@ public:
         uint32_t turn_id,
         uint64_t conv_hash = 0,
         const std::string& user_id = std::string(),
-        double* out_io_ms = nullptr
+        double* out_io_ms = nullptr,
+        uint64_t* out_checkpoint_id = nullptr
     );
 
     // Load a checkpoint back to slot memory
@@ -137,6 +144,17 @@ public:
     // out_io_ms, if non-null, receives the wall-clock time (ms) of the
     // underlying SSD disk read; 0.0 when the checkpoint was served from the
     // hot/warm RAM tier (no disk I/O) -- used by cache-operations logging.
+    // out_checkpoint_id, if non-null, receives the kv_ssd_cache checkpoint
+    // id that was matched and loaded -- used by the narrative
+    // "[Conversation ...] Loading ... from snapshot <id>" live server log
+    // line (see server_cache_event::snapshot_id in server-cache-log.h).
+    // out_had_candidate, if non-null, is set to true as soon as a candidate
+    // checkpoint is found (i.e. before the load attempt), regardless of
+    // whether the subsequent load succeeds -- lets the caller distinguish
+    // "no checkpoint existed to try" (out_had_candidate left false, the
+    // ordinary first-turn case) from "a checkpoint existed but loading it
+    // failed" (out_had_candidate true, function still returns false) for
+    // logging a restore-failure warning instead of silently doing nothing.
     bool find_and_load_checkpoint(
         const llama_token* tokens,
         size_t tokens_size,
@@ -155,7 +173,9 @@ public:
         float* out_overlap = nullptr,
         bool* out_is_continuation = nullptr,
         const std::string& user_id = std::string(),
-        double* out_io_ms = nullptr
+        double* out_io_ms = nullptr,
+        uint64_t* out_checkpoint_id = nullptr,
+        bool* out_had_candidate = nullptr
     );
 
    // Evict all checkpoints for a specific slot

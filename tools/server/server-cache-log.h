@@ -39,8 +39,12 @@ std::string format_bytes_human(std::optional<int64_t> bytes);
 struct server_cache_event {
     // Short verb-ish operation name, e.g. "slot_save", "slot_restore",
     // "slot_erase", "ctx_shift", "checkpoint_create", "checkpoint_evict",
-    // "ssd_store", "ssd_restore", "ssd_maintenance", "sys_cache_store",
-    // "sys_cache_hit", "model_load".
+    // "ssd_store", "ssd_restore", "ssd_restore_fail" (a candidate checkpoint
+    // was found but loading it failed -- distinct from the ordinary "no
+    // checkpoint yet" case, which isn't logged at all), "ssd_maintenance",
+    // "sys_cache_store", "sys_cache_hit", "model_load". Kept to <= 18 chars
+    // (see W_OP in server-cache-log.cpp) so the fixed-width table column
+    // doesn't overflow.
     std::string operation;
     // Where the operation happened / what it touched, e.g. "disk", "ram",
     // "hot->warm", "warm->cold", "cold (disk)".
@@ -53,6 +57,32 @@ struct server_cache_event {
     // "=== CACHE ===" section omits it as redundant with that file's own
     // surrounding request context (see server-request-log.h).
     std::string detail;
+
+    // Identifies the specific snapshot/checkpoint this event touched, for
+    // the narrative "[Conversation ...] ... snapshot/checkpoint <id>" live
+    // server log line (see server_context_impl::narrate_cache_event() in
+    // server-context.cpp). For "ssd_store"/"ssd_restore" this is the
+    // kv_ssd_cache checkpoint id (from kv_ssd_store() / the internal
+    // find_match() id, threaded through server_context_page_manager's
+    // store_checkpoint_with_tokens()/find_and_load_checkpoint() out-params).
+    // For "checkpoint_create"/"checkpoint_evict" (RAM-only checkpoints, no
+    // SSD id) this is instead the 1-based index of the checkpoint within
+    // slot.prompt.checkpoints -- the same "checkpoint N of M" numbering
+    // already used by the nearby SLT_TRC/SLT_INF lines, reused here rather
+    // than inventing a new numbering scheme. Unset when not meaningful
+    // (slot_save/restore/erase, ctx_shift, sys_cache_*, ssd_maintenance,
+    // model_load).
+    std::optional<uint64_t> snapshot_id;
+
+    // Slot id, for the narrative "[Slot N]" scope label, only needed when
+    // this event is logged with note_cache_event(nullptr, ...) -- i.e. not
+    // tied to a slot currently processing a request (slot save/restore/
+    // erase) -- so narrate_cache_event() has no `server_slot*` to read an
+    // id from. Independent of note_cache_event()'s own `slot` parameter,
+    // which governs per-request "=== CACHE ===" section attribution, not
+    // display; events that DO carry a slot pointer there derive their scope
+    // label from slot->conv_hash / slot->id instead and leave this unset.
+    std::optional<int64_t> slot_id;
 };
 
 // Lazily opens (append mode, never truncated on restart) `<dir>/cache-operations.log`
