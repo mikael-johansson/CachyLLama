@@ -91,6 +91,15 @@ struct server_request_log_writer {
     // Write the header sections. Called once per request, after the request
     // has been parsed/validated and the effective sampling params are known,
     // but before any task is posted to the queue.
+    //
+    // `thinking_forced_open`: true when this request's chat template appends
+    // an opening reasoning-block tag (e.g. "<think>") to the end of the
+    // rendered prompt, forcing the model straight into its reasoning phase.
+    // In that case the model's own generated tokens never include the
+    // opening tag (only the matching close), so the writer synthesizes it as
+    // the first line of "=== RESPONSE (streaming) ===" -- otherwise the log
+    // shows a lone closing tag with no opener, which reads as truncation.
+    // See REQUEST_LOGGING_SPEC.md Part 1 "Reasoning-model <think> prefix".
     virtual void write_header(
         const std::string & request_id,
         const std::string & client_addr,
@@ -102,7 +111,8 @@ struct server_request_log_writer {
         const nlohmann::ordered_json & sampling_params,
         const nlohmann::ordered_json & model_settings,
         const std::string & raw_request_body,
-        const std::string & prompt_text) = 0;
+        const std::string & prompt_text,
+        bool thinking_forced_open = false) = 0;
 
     // Number of terminal (final or error) results expected before the
     // request as a whole is considered done. 1 for a normal request, >1 only

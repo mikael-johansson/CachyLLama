@@ -5068,6 +5068,32 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     {"model_n_ctx_train",  meta->model_n_ctx_train},
                 };
 
+                // Detect forced-thinking-open: reasoning-model chat templates
+                // often append an opening reasoning tag (e.g. "<think>") to
+                // the end of the rendered prompt, forcing the model straight
+                // into its reasoning phase -- the model's own generated
+                // tokens then never include that opening tag (only the
+                // matching close). oaicompat_chat_params_parse()
+                // (server-common.cpp) already threads both pieces of this
+                // signal into the per-request params json: "generation_prompt"
+                // (chat_params.generation_prompt, unconditionally present)
+                // and "reasoning_budget_start_tag" (chat_params.thinking_start_tag,
+                // present only when the template supports thinking). Reusing
+                // them here -- rather than re-deriving the signal -- is
+                // exactly what server_response_reader's own PEG parser does
+                // when it reparses generated text (common_chat_peg_parse()
+                // prepends params.generation_prompt to the model's raw
+                // output before parsing); both fields are empty/absent for
+                // non-chat requests or templates that don't force thinking.
+                bool thinking_forced_open = false;
+                {
+                    const std::string gen_prompt = json_value(data, "generation_prompt", std::string());
+                    const std::string think_tag  = json_value(data, "reasoning_budget_start_tag", std::string());
+                    if (!gen_prompt.empty() && !think_tag.empty()) {
+                        thinking_forced_open = string_ends_with(string_strip(gen_prompt), think_tag);
+                    }
+                }
+
                 res->req_log->write_header(
                     request_id,
                     req.remote_addr,
@@ -5079,7 +5105,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     tasks.front().params.to_json(),
                     model_settings,
                     req.body,
-                    prompt_text);
+                    prompt_text,
+                    thinking_forced_open);
 
                 rd.on_result = [w = res->req_log.get()](const server_task_result_ptr & result) {
                     w->on_result(result);

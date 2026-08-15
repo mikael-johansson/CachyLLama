@@ -198,7 +198,7 @@ public:
     void write_header(
         const std::string &, const std::string &, const std::string &, const std::string &,
         const std::string &, const std::string &, const std::map<std::string, std::string> &,
-        const json &, const json &, const std::string &, const std::string &) override {}
+        const json &, const json &, const std::string &, const std::string &, bool) override {}
     void set_expected_results(size_t) override {}
     void on_result(const std::unique_ptr<server_task_result> &) override {}
     void write_error(const std::string &, const std::string &, std::optional<int>) override {}
@@ -259,8 +259,11 @@ public:
             const json & sampling_params,
             const json & model_settings,
             const std::string & raw_request_body,
-            const std::string & prompt_text) override {
+            const std::string & prompt_text,
+            bool thinking_forced_open) override {
         try {
+            thinking_forced_open_ = thinking_forced_open;
+
             ensure_open();
             if (!ofs_.is_open()) {
                 return;
@@ -393,6 +396,16 @@ private:
     void append_chunk(const std::string & text) {
         if (!chunk_header_written_) {
             ofs_ << "\n=== RESPONSE (streaming) ===\n";
+            if (thinking_forced_open_) {
+                // The chat template appended an opening "<think>" (or
+                // equivalent) to the end of the rendered prompt, so the
+                // model's own generated tokens never include it -- only the
+                // matching close. Synthesize it here so the log doesn't read
+                // as a truncated response; see write_header()'s doc comment
+                // and REQUEST_LOGGING_SPEC.md's "Reasoning-model <think>
+                // prefix" section.
+                ofs_ << "<think>\n";
+            }
             chunk_header_written_ = true;
         }
         ofs_ << text;
@@ -528,7 +541,8 @@ private:
     std::ofstream ofs_;
     bool opened_    = false;
     bool finalized_ = false;
-    bool chunk_header_written_ = false;
+    bool chunk_header_written_  = false;
+    bool thinking_forced_open_  = false;
 
     size_t expected_results_ = 1;
     size_t finals_seen_      = 0;
