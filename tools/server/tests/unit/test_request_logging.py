@@ -17,7 +17,13 @@ def create_server():
 
 
 def log_files(directory: str):
-    return sorted(glob.glob(os.path.join(directory, "*.log")))
+    # cache-operations.log (see test_cache_operations_logging.py) lives in
+    # this same --request-logging-dir directory by design (a shared,
+    # server-lifetime file, not a per-request one) -- exclude it so callers
+    # here only ever see per-request log files.
+    files = glob.glob(os.path.join(directory, "*.log"))
+    files = [f for f in files if os.path.basename(f) != "cache-operations.log"]
+    return sorted(files)
 
 
 def wait_for_log_file(directory: str, timeout: float = 10.0):
