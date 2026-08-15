@@ -480,7 +480,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
                     "model_load", "ram",
                     std::nullopt, (int64_t) meta.model_size, perf.t_load_ms,
                     "model=" + meta.model_name,
+                    std::nullopt, std::nullopt,
                 });
+                // Narrative counterpart for the live server log (console/
+                // stdout), same event as the cache-operations.log row above
+                // -- see server_context_impl::narrate_cache_event() in
+                // server-context.cpp for the equivalent hook used by every
+                // other cache operation; this one is a one-off because model
+                // load happens here, before request handling (and hence
+                // note_cache_event()'s slot-based dispatch) exists at all.
+                LOG_INF("[Server] Loaded model %s (%s ms)\n",
+                        meta.model_name.c_str(), fmt_fixed(perf.t_load_ms, 1).c_str());
             }
         }
 

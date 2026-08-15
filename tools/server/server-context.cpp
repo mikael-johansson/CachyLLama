@@ -24,10 +24,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cinttypes>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <sstream>
 #include <utility>
 #include <fstream>
 
@@ -2699,12 +2701,143 @@ private:
             return;
         }
         server_cache_log_note(ev);
+        narrate_cache_event(slot, ev);
         if (slot != nullptr) {
             try {
                 slot->pending_cache_events.push_back(ev);
             } catch (...) {
                 // best-effort: never let logging break request handling
             }
+        }
+    }
+
+    // Extract the value of "key=value" out of a "key1=value1 key2=value2"
+    // detail string (see server_cache_event::detail) -- used below to
+    // recover values that are already encoded in ev.detail at the call site
+    // (e.g. ctx_shift's "kept=" / "discarded=", ssd_maintenance's "turn=")
+    // for the narrative line, rather than adding dedicated struct fields
+    // just for display. Returns "" if `key` isn't present.
+    static std::string cache_event_detail_field(const std::string & detail, const std::string & key) {
+        size_t pos = detail.find(key);
+        if (pos == std::string::npos) {
+            return "";
+        }
+        pos += key.size();
+        size_t end = detail.find(' ', pos);
+        return detail.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    }
+
+    // Render `hash` as the same 16-hex-char form used elsewhere in this file
+    // for conv_hash (e.g. "system prompt cache hit: hash=%016lx").
+    static std::string cache_event_hex16(uint64_t hash) {
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long) hash);
+        return std::string(buf);
+    }
+
+    // Emit one human-readable, single-line narrative for a cache event to
+    // the live server log (LOG_INF / LOG_WRN via common/log.h -- the
+    // console/stdout stream, as opposed to the structured cache-operations.log
+    // row server_cache_log_note() just wrote above in note_cache_event()).
+    // Same event, phrased as a sentence for whoever is watching the console
+    // rather than tailing the log file, e.g.:
+    //   [Conversation 00f1a2b3c4d5e6f7] Saving 512 tokens to checkpoint 3/32 (RAM, 12.3 MiB)
+    //   [Slot 1] Saving 84 tokens to disk file slot1.bin (1.2 KB, 3.401 ms)
+    //
+    // `slot` is the same pointer note_cache_event() received: non-null for
+    // events tied to a slot currently processing a task, in which case the
+    // scope label is derived from slot->conv_hash ("[Conversation ...]"),
+    // falling back to slot->id ("[Slot N]") if conv_hash is unset. nullptr
+    // for events that aren't tied to an in-flight request (slot save/
+    // restore/erase, background SSD maintenance, system-prompt-cache store,
+    // model load); ev.slot_id supplies "[Slot N]" for the former subset of
+    // those (slot save/restore/erase -- see server_cache_event::slot_id's
+    // doc comment), everything else falls back to "[Server]".
+    //
+    // Gated by the caller (note_cache_event()) on
+    // params_base.request_logging_enabled. Best-effort: never throws.
+    void narrate_cache_event(server_slot * slot, const server_cache_event & ev) {
+        try {
+            std::string scope;
+            if (slot != nullptr && slot->conv_hash != 0) {
+                scope = "Conversation " + cache_event_hex16(slot->conv_hash);
+            } else if (ev.slot_id) {
+                scope = "Slot " + std::to_string(*ev.slot_id);
+            } else if (slot != nullptr) {
+                scope = "Slot " + std::to_string(slot->id);
+            } else {
+                scope = "Server";
+            }
+
+            const std::string tokens_str = ev.tokens ? std::to_string(*ev.tokens) : "?";
+            const std::string snap_str   = ev.snapshot_id ? std::to_string(*ev.snapshot_id) : std::string("?");
+            const std::string size_mib   = ev.bytes
+                ? fmt_fixed((double) *ev.bytes / 1024.0 / 1024.0, 1) + " MiB"
+                : "size n/a";
+            const std::string dur_ms     = fmt_fixed(ev.duration_ms, 1) + " ms";
+
+            std::ostringstream line;
+            line << "[" << scope << "] ";
+
+            bool is_warning = false;
+
+            if (ev.operation == "checkpoint_create") {
+                line << "Saving " << tokens_str << " tokens to checkpoint " << snap_str
+                     << "/" << params_base.n_ctx_checkpoints << " (RAM, " << size_mib << ")";
+            } else if (ev.operation == "checkpoint_evict") {
+                line << "Evicting checkpoint " << snap_str << " from RAM (" << tokens_str
+                     << " tokens, " << size_mib << ")";
+            } else if (ev.operation == "ssd_store") {
+                line << "Saving " << tokens_str << " tokens to snapshot " << snap_str
+                     << " on DISK (" << size_mib << ", " << dur_ms << ")";
+            } else if (ev.operation == "ssd_restore") {
+                const bool on_disk = ev.location.find("disk") != std::string::npos;
+                line << "Loading " << tokens_str << " tokens from snapshot " << snap_str
+                     << " [" << (on_disk ? "on DISK" : "in RAM") << "] (" << dur_ms << ")";
+            } else if (ev.operation == "ssd_restore_fail") {
+                is_warning = true;
+                line << "Failed to load snapshot " << snap_str << " ("
+                     << (ev.tokens ? tokens_str + " tokens expected, " : std::string())
+                     << dur_ms << ") -- falling back to full re-prefill";
+            } else if (ev.operation == "ctx_shift") {
+                const std::string kept = cache_event_detail_field(ev.detail, "kept=");
+                line << "Context shift: dropping " << tokens_str << " tokens"
+                     << (kept.empty() ? "" : ", keeping " + kept) << " (" << dur_ms << ")";
+            } else if (ev.operation == "ssd_maintenance") {
+                const std::string turn = cache_event_detail_field(ev.detail, "turn=");
+                line << "SSD cache maintenance sweep"
+                     << (turn.empty() ? "" : " (turn " + turn + ")") << " (" << dur_ms << ")";
+            } else if (ev.operation == "sys_cache_store") {
+                line << "Storing " << tokens_str << "-token system prompt in cache ("
+                     << (ev.bytes ? std::to_string(*ev.bytes) + " bytes" : "size n/a") << ")";
+            } else if (ev.operation == "sys_cache_hit") {
+                line << "Loading " << tokens_str << "-token system prompt from cache (RAM, " << dur_ms << ")";
+            } else if (ev.operation == "slot_save") {
+                const std::string file = cache_event_detail_field(ev.detail, "file=");
+                line << "Saving " << tokens_str << " tokens to disk file "
+                     << (file.empty() ? "?" : file) << " (" << size_mib << ", " << dur_ms << ")";
+            } else if (ev.operation == "slot_restore") {
+                const std::string file = cache_event_detail_field(ev.detail, "file=");
+                line << "Loading " << tokens_str << " tokens from disk file "
+                     << (file.empty() ? "?" : file) << " (" << size_mib << ", " << dur_ms << ")";
+            } else if (ev.operation == "slot_erase") {
+                line << "Erased " << tokens_str << " tokens from cache";
+            } else if (ev.operation == "model_load") {
+                line << "Loaded model " << cache_event_detail_field(ev.detail, "model=")
+                     << " (" << dur_ms << ")";
+            } else {
+                // Unknown/future operation: fall back to a generic sentence
+                // rather than silently dropping the narrative line.
+                line << ev.operation << " (" << tokens_str << " tokens, " << dur_ms << ")";
+            }
+
+            if (is_warning) {
+                LOG_WRN("%s\n", line.str().c_str());
+            } else {
+                LOG_INF("%s\n", line.str().c_str());
+            }
+        } catch (...) {
+            // best-effort: never let logging break request handling
         }
     }
 
@@ -2750,10 +2883,16 @@ private:
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     worst->pos_min, worst->pos_max, worst->n_tokens, (float) worst->size() / 1024 / 1024);
+            // 1-based index within slot.prompt.checkpoints, matching the
+            // "checkpoint N of M" numbering used by SLT_TRC/SLT_INF nearby --
+            // reused as the narrative snapshot id (see
+            // server_cache_event::snapshot_id).
+            const uint64_t evict_idx = (uint64_t) std::distance(slot.prompt.checkpoints.begin(), worst) + 1;
             note_cache_event(&slot, server_cache_event{
                 "checkpoint_evict", "ram",
                 worst->n_tokens, (int64_t) worst->size(), 0.0,
                 "pos_min=" + std::to_string(worst->pos_min) + " pos_max=" + std::to_string(worst->pos_max),
+                evict_idx, std::nullopt,
             });
             slot.prompt.checkpoints.erase(worst);
         }
@@ -2779,6 +2918,7 @@ private:
             "checkpoint_create", "ram",
             cur.n_tokens, (int64_t) cur.size(), t_ckpt_ms,
             "pos_min=" + std::to_string(cur.pos_min) + " pos_max=" + std::to_string(cur.pos_max),
+            (uint64_t) slot.prompt.checkpoints.size(), std::nullopt,
         });
 
         SLT_TRC(slot,
@@ -2791,18 +2931,20 @@ private:
             const auto & prefix_tokens = slot.prompt.tokens;
             const int64_t t_ssd_start = ggml_time_us();
             double io_ms = 0.0;
+            uint64_t ssd_ckpt_id = 0;
             bool stored = ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_tokens.get_tokens().data(),
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string(),
-                &io_ms);
+                &io_ms, &ssd_ckpt_id);
             const double t_ssd_ms = (ggml_time_us() - t_ssd_start) / 1000.0;
             if (stored) {
                 note_cache_event(&slot, server_cache_event{
                     "ssd_store", "disk",
                     cur.n_tokens, (int64_t) cur.size(), io_ms > 0.0 ? io_ms : t_ssd_ms, "",
+                    ssd_ckpt_id, std::nullopt,
                 });
             }
         }
@@ -2850,6 +2992,7 @@ private:
         note_cache_event(&slot, server_cache_event{
             "checkpoint_create", "ram",
             cur.n_tokens, (int64_t) cur.size(), t_ckpt_ms, "final",
+            (uint64_t) slot.prompt.checkpoints.size(), std::nullopt,
         });
 
         SLT_INF(slot,
@@ -2864,16 +3007,18 @@ private:
                 : slot.prompt.tokens.get_tokens();
             const int64_t t_ssd_start = ggml_time_us();
             double io_ms = 0.0;
+            uint64_t ssd_ckpt_id = 0;
             bool stored = ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
                 slot.task ? slot.task->user_id : std::string(),
-                &io_ms);
+                &io_ms, &ssd_ckpt_id);
             const double t_ssd_ms = (ggml_time_us() - t_ssd_start) / 1000.0;
             if (stored) {
                 note_cache_event(&slot, server_cache_event{
                     "ssd_store", "disk",
                     cur.n_tokens, (int64_t) cur.size(), io_ms > 0.0 ? io_ms : t_ssd_ms, "final",
+                    ssd_ckpt_id, std::nullopt,
                 });
             }
         }
@@ -2953,6 +3098,7 @@ private:
             note_cache_event(nullptr, server_cache_event{
                 "sys_cache_store", "ram",
                 (int64_t) n_sys, (int64_t) got, t_ms, "",
+                std::nullopt, std::nullopt,
             });
         }
     }
@@ -2975,6 +3121,7 @@ private:
             note_cache_event(nullptr, server_cache_event{
                 "ssd_maintenance", "tiered", std::nullopt, std::nullopt, t_ms,
                 "turn=" + std::to_string(ssd_turn_counter),
+                std::nullopt, std::nullopt,
             });
         }
 
@@ -3194,6 +3341,7 @@ private:
                         "slot_save", "disk",
                         (int64_t) token_count, (int64_t) nwrite, t_save_ms,
                         "slot=" + std::to_string(id_slot) + " file=" + filename,
+                        std::nullopt, (int64_t) id_slot,
                     });
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
@@ -3264,6 +3412,7 @@ private:
                         "slot_restore", "disk",
                         (int64_t) token_count, (int64_t) nread, t_restore_ms,
                         "slot=" + std::to_string(id_slot) + " file=" + filename,
+                        std::nullopt, (int64_t) id_slot,
                     });
 
                     auto res = std::make_unique<server_task_result_slot_save_load>();
@@ -3306,6 +3455,7 @@ private:
                         "slot_erase", "ram",
                         (int64_t) n_erased, std::nullopt, t_erase_ms,
                         "slot=" + std::to_string(id_slot),
+                        std::nullopt, (int64_t) id_slot,
                     });
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
@@ -3580,6 +3730,7 @@ private:
                     "ctx_shift", "ram",
                     (int64_t) n_discard, std::nullopt, t_shift_ms,
                     "kept=" + std::to_string(n_keep) + " discarded=" + std::to_string(n_discard),
+                    std::nullopt, std::nullopt,
                 });
 
                 // add generated tokens to cache
@@ -3810,6 +3961,8 @@ private:
                                 std::vector<uint8_t> ssd_spec_data;
                                 const int64_t t_ssd_restore_start = ggml_time_us();
                                 double ssd_restore_io_ms = 0.0;
+                                uint64_t ssd_ckpt_id = 0;
+                                bool ssd_had_candidate = false;
                                 bool ssd_restore_ok = ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt, ctx_dft.get(),
@@ -3818,7 +3971,8 @@ private:
                                         &ssd_spec_data,
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(),
                                         &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
-                                        slot.task->user_id, &ssd_restore_io_ms);
+                                        slot.task->user_id, &ssd_restore_io_ms,
+                                        &ssd_ckpt_id, &ssd_had_candidate);
                                 const double t_ssd_restore_ms = (ggml_time_us() - t_ssd_restore_start) / 1000.0;
                                 if (ssd_restore_ok) {
                                     note_cache_event(&slot, server_cache_event{
@@ -3826,6 +3980,26 @@ private:
                                         (int64_t) ssd_n_tokens, std::nullopt,
                                         ssd_restore_io_ms > 0.0 ? ssd_restore_io_ms : t_ssd_restore_ms,
                                         "cold-start",
+                                        ssd_ckpt_id, std::nullopt,
+                                    });
+                                } else if (ssd_had_candidate) {
+                                    // A candidate checkpoint was found (find_match hit) but
+                                    // the subsequent load failed -- missing/corrupted file,
+                                    // I/O error, etc. Distinct from the ordinary "no cached
+                                    // checkpoint yet" case (ssd_had_candidate stays false on
+                                    // a first-ever turn), which is not a failure and should
+                                    // not be logged. Both the live server log (SLT_WRN) and
+                                    // the structured cache-operations.log get a row so a
+                                    // silent restore failure never vanishes without a trace
+                                    // (see REQUEST_LOGGING.md housekeeping fix history).
+                                    SLT_WRN(slot,
+                                            "SSD cache restore attempted but failed (candidate checkpoint id=%" PRIu64 " found for cold-start, load did not succeed) -- falling back to full re-prefill\n",
+                                            ssd_ckpt_id);
+                                    note_cache_event(&slot, server_cache_event{
+                                        "ssd_restore_fail", "disk",
+                                        std::nullopt, std::nullopt, t_ssd_restore_ms,
+                                        "cold-start",
+                                        ssd_ckpt_id, std::nullopt,
                                     });
                                 }
                                 if (ssd_restore_ok) {
@@ -3948,6 +4122,7 @@ private:
                                     note_cache_event(&slot, server_cache_event{
                                         "sys_cache_hit", "ram",
                                         (int64_t) n_sys, (int64_t) sys_data.size(), t_sys_load_ms, "",
+                                        std::nullopt, std::nullopt,
                                     });
                                     // Restore system prompt state from cache
                                     // Match the save flag (PARTIAL_ONLY) used by
@@ -4286,6 +4461,7 @@ private:
                                         "sys_cache_hit", "ram",
                                         (int64_t) recovered_n_sys, (int64_t) sys_data.size(), t_sys_load_ms,
                                         "do_reset_fallback",
+                                        std::nullopt, std::nullopt,
                                     });
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
