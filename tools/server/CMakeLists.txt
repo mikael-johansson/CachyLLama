@@ -29,6 +29,8 @@ add_library(${TARGET} STATIC
     server-schema.h
     server-request-log.cpp
     server-request-log.h
+    server-cache-log.cpp
+    server-cache-log.h
 )
 
 if (BUILD_SHARED_LIBS)
