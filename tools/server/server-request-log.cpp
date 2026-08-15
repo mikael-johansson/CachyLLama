@@ -16,11 +16,8 @@
 
 namespace {
 
-std::string fmt_fixed(double v, int prec) {
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(prec) << v;
-    return oss.str();
-}
+// fmt_fixed() lives in server-cache-log.cpp now (shared with the
+// cache-operations tables); pulled in via server-request-log.h.
 
 std::string iso8601_utc(std::chrono::system_clock::time_point tp, bool filesystem_safe) {
     const std::time_t t = std::chrono::system_clock::to_time_t(tp);
@@ -201,6 +198,7 @@ public:
         const json &, const json &, const std::string &, const std::string &, bool) override {}
     void set_expected_results(size_t) override {}
     void on_result(const std::unique_ptr<server_task_result> &) override {}
+    void note_cache_event(const server_cache_event &) override {}
     void write_error(const std::string &, const std::string &, std::optional<int>) override {}
     void close() override {}
 };
@@ -332,6 +330,9 @@ public:
             if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
                 note_progress(partial->n_decoded, partial->n_prompt_tokens, partial->n_prompt_tokens_cache,
                                partial->timings, partial->queue_wait_us);
+                for (const auto & ev : partial->cache_events) {
+                    note_cache_event(ev);
+                }
                 if (!partial->is_begin && !partial->is_progress && !partial->content.empty()) {
                     append_chunk(partial->content);
                 }
@@ -341,6 +342,9 @@ public:
             if (auto * final_res = dynamic_cast<server_task_result_cmpl_final *>(result.get())) {
                 note_progress(final_res->n_decoded, final_res->n_prompt_tokens, final_res->n_prompt_tokens_cache,
                                final_res->timings, final_res->queue_wait_us);
+                for (const auto & ev : final_res->cache_events) {
+                    note_cache_event(ev);
+                }
                 if (!final_res->content.empty()) {
                     // content is only non-empty here for the non-streaming
                     // case; in streaming mode the text was already sent via
@@ -352,6 +356,14 @@ public:
                     finalize_success();
                 }
             }
+        } catch (...) {
+            // best-effort: never let logging break request handling
+        }
+    }
+
+    void note_cache_event(const server_cache_event & ev) override {
+        try {
+            cache_events_.push_back(ev);
         } catch (...) {
             // best-effort: never let logging break request handling
         }
@@ -502,11 +514,29 @@ private:
         ofs_.flush();
     }
 
+    // Writes the "=== CACHE ===" section (see server-request-log.h's
+    // note_cache_event() doc comment) positioned after "=== RESPONSE
+    // (streaming) ===" / "=== ERROR ===" and before the performance footer.
+    // Omitted entirely -- not printed empty -- when this request had no
+    // cache events beyond ordinary prefix-cache reuse (already covered by
+    // the footer's "Cached tokens" row).
+    void write_cache_section() {
+        if (cache_events_.empty()) {
+            return;
+        }
+        ofs_ << "\n=== CACHE ===\n";
+        ofs_ << server_cache_log_header_row(/* with_timestamp_and_detail */ false) << "\n";
+        for (const auto & ev : cache_events_) {
+            ofs_ << server_cache_log_format_row(ev, /* with_timestamp_and_detail */ false) << "\n";
+        }
+    }
+
     void finalize_success() {
         if (finalized_) {
             return;
         }
         finalized_ = true;
+        write_cache_section();
         write_footer_block("PERFORMANCE", build_footer());
     }
 
@@ -522,6 +552,7 @@ private:
         if (http_status) {
             ofs_ << "http_status: " << *http_status << "\n";
         }
+        write_cache_section();
         write_footer_block("PERFORMANCE (partial)", build_footer());
     }
 
@@ -532,6 +563,7 @@ private:
         finalized_ = true;
         ofs_ << "\n=== CANCELLED ===\n";
         ofs_ << "message: request was destroyed before completion (client disconnect or server-side cancellation)\n";
+        write_cache_section();
         write_footer_block("PERFORMANCE (partial)", build_footer());
         ofs_.flush();
         ofs_.close();
@@ -553,6 +585,8 @@ private:
     bool have_timings_ = false;
     result_timings last_timings_;
     std::optional<double> last_queue_wait_sec_;
+
+    std::vector<server_cache_event> cache_events_;
 
     std::chrono::steady_clock::time_point t_start_ = std::chrono::steady_clock::now();
 };

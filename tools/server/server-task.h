@@ -7,9 +7,14 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+
+// server_cache_event: internal-only, request-logging field (see
+// queue_wait_us below for the precedent). Lightweight header, no heavy deps.
+#include "server-cache-log.h"
 
 using json = nlohmann::ordered_json;
 
@@ -375,6 +380,16 @@ struct server_task_result_cmpl_final : server_task_result {
     // the public API response, only used internally by request logging.
     int64_t queue_wait_us = -1;
 
+    // Cache operations (context shift, checkpoint create/evict, SSD store/
+    // restore, system-prompt-cache hit, ...) that happened synchronously
+    // while this slot processed this request, queued on server_slot and
+    // drained into this field the moment a result is built (see
+    // send_final_response() / send_partial_response() in server-context.cpp).
+    // Same "internal-only, not part of to_json()" treatment as queue_wait_us
+    // above -- consumed solely by server-request-log.cpp's "=== CACHE ==="
+    // section.
+    std::vector<server_cache_event> cache_events;
+
     bool truncated;
     int32_t n_decoded;
     int32_t n_prompt_tokens;
@@ -451,6 +466,9 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     // see server_task_result_cmpl_final::queue_wait_us
     int64_t queue_wait_us = -1;
+
+    // see server_task_result_cmpl_final::cache_events
+    std::vector<server_cache_event> cache_events;
 
     bool post_sampling_probs;
     bool is_progress = false;

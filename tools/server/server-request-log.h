@@ -46,6 +46,8 @@
 // Fields that can't be computed are omitted, never faked as 0 -- see the
 // spec's "fields that can't be computed" note.
 
+#include "server-cache-log.h" // server_cache_event
+
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
@@ -128,6 +130,18 @@ struct server_request_log_writer {
     // PERFORMANCE / ERROR+PERFORMANCE(partial) block once the expected
     // number of terminal results has been seen. Never throws.
     virtual void on_result(const std::unique_ptr<server_task_result> & result) = 0;
+
+    // Buffer one cache operation (context shift, checkpoint create/evict,
+    // SSD store/restore, system-prompt-cache hit, ...) that happened
+    // synchronously while this request was being processed, for inclusion in
+    // a "=== CACHE ===" section written just before the performance footer.
+    // This is purely the per-request view -- the same event is also, and
+    // independently, written to the shared server-lifetime
+    // cache-operations.log by the caller (see server-cache-log.h); this
+    // method never touches that file itself. If the request ends up with no
+    // buffered events, the section is omitted entirely rather than printed
+    // empty. Never throws.
+    virtual void note_cache_event(const server_cache_event & ev) = 0;
 
     // Explicitly record a failure that happened before any task was ever
     // posted to the queue (request validation, per-user rate limiting,
