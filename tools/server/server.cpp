@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "server-cache-log.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -462,6 +463,26 @@ int llama_server(common_params & params, int argc, char ** argv) {
         ctx_http.is_ready.store(true);
 
         SRV_INF("%s", "model loaded\n");
+
+        // Cache-operations logging (opt-in, --request-logging-dir -- see
+        // server-cache-log.h). Initialize the shared, server-lifetime
+        // cache-operations.log here, alongside the other server-lifetime
+        // state that's gated on this flag, and log the one-time model-load
+        // row (model->t_load_us is already measured internally but
+        // otherwise only surfaces via llama_perf_context_print() on exit).
+        if (params.request_logging_enabled) {
+            server_cache_log_init(params.path_request_log_dir);
+            llama_context * ctx_for_perf = ctx_server.get_llama_context();
+            if (ctx_for_perf) {
+                const auto perf = llama_perf_context(ctx_for_perf);
+                const auto meta = ctx_server.get_meta();
+                server_cache_log_note(server_cache_event{
+                    "model_load", "ram",
+                    std::nullopt, (int64_t) meta.model_size, perf.t_load_ms,
+                    "model=" + meta.model_name,
+                });
+            }
+        }
 
         shutdown_handler = [&](int) {
             mcp_mgr.shutdown();

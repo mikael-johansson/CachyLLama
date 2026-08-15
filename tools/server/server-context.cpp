@@ -10,6 +10,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-request-log.h"
+#include "server-cache-log.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -216,6 +217,14 @@ struct server_slot {
     uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
     std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
 
+    // Cache operations recorded synchronously while this slot processes its
+    // current task (context shift, checkpoint create/evict, SSD store/
+    // restore, system-prompt-cache hit, ...). Drained into the next result
+    // sent for this slot (send_partial_response()/send_final_response()) so
+    // request logging can render them in that request's "=== CACHE ==="
+    // section -- see server_context_impl::note_cache_event().
+    std::vector<server_cache_event> pending_cache_events;
+
     stop_type stop;
 
     std::string stopping_word;
@@ -311,6 +320,7 @@ struct server_slot {
         ssd_cold_start_used       = false;
         conv_hash                 = 0;
         user_id_.clear();
+        pending_cache_events.clear();
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -2328,6 +2338,14 @@ private:
             res->queue_wait_us = slot.t_start_process_prompt - slot.task->t_arrival_us;
         }
 
+        // cache events recorded since the last result sent for this slot
+        // (see note_cache_event()) -- drained here so request logging's
+        // "=== CACHE ===" section sees them.
+        if (!slot.pending_cache_events.empty()) {
+            res->cache_events = std::move(slot.pending_cache_events);
+            slot.pending_cache_events.clear();
+        }
+
         res->verbose           = slot.task->params.verbose;
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
@@ -2384,6 +2402,12 @@ private:
         // queue-wait time for request logging (see server_task::t_arrival_us)
         if (slot.task->t_arrival_us > 0 && slot.t_start_process_prompt > 0) {
             res->queue_wait_us = slot.t_start_process_prompt - slot.task->t_arrival_us;
+        }
+
+        // see send_partial_response() above
+        if (!slot.pending_cache_events.empty()) {
+            res->cache_events = std::move(slot.pending_cache_events);
+            slot.pending_cache_events.clear();
         }
 
         res->verbose           = slot.task->params.verbose;
@@ -2659,6 +2683,31 @@ private:
         return true;
     }
 
+    // Record a cache operation for logging (see REQUEST_LOGGING_SPEC.md's
+    // cache-operations design). Always writes to the shared, server-lifetime
+    // cache-operations.log via server_cache_log_note() -- a no-op unless
+    // --request-logging-dir is set (server_cache_log_init() gates on that at
+    // startup). When `slot` is non-null, the event is ALSO queued on the
+    // slot so it rides along on the next result sent for that slot's current
+    // task, ending up in that request's own per-request "=== CACHE ==="
+    // section (see server-request-log.{h,cpp}). Pass nullptr for cache
+    // events that aren't tied to one specific in-flight completion request
+    // (slot save/restore/erase, background SSD tier maintenance,
+    // system-prompt-cache store, model load). Best-effort: never throws.
+    void note_cache_event(server_slot * slot, const server_cache_event & ev) {
+        if (!params_base.request_logging_enabled) {
+            return;
+        }
+        server_cache_log_note(ev);
+        if (slot != nullptr) {
+            try {
+                slot->pending_cache_events.push_back(ev);
+            } catch (...) {
+                // best-effort: never let logging break request handling
+            }
+        }
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         // Evict the least-useful checkpoint when at capacity.
@@ -2701,12 +2750,19 @@ private:
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     worst->pos_min, worst->pos_max, worst->n_tokens, (float) worst->size() / 1024 / 1024);
+            note_cache_event(&slot, server_cache_event{
+                "checkpoint_evict", "ram",
+                worst->n_tokens, (int64_t) worst->size(), 0.0,
+                "pos_min=" + std::to_string(worst->pos_min) + " pos_max=" + std::to_string(worst->pos_max),
+            });
             slot.prompt.checkpoints.erase(worst);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+
+        const int64_t t_ckpt_start = ggml_time_us();
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2718,6 +2774,13 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
+        const double t_ckpt_ms = (ggml_time_us() - t_ckpt_start) / 1000.0;
+        note_cache_event(&slot, server_cache_event{
+            "checkpoint_create", "ram",
+            cur.n_tokens, (int64_t) cur.size(), t_ckpt_ms,
+            "pos_min=" + std::to_string(cur.pos_min) + " pos_max=" + std::to_string(cur.pos_max),
+        });
+
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
@@ -2726,12 +2789,22 @@ private:
         // SSD-backed KV cache: store checkpoint on disk
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.prompt.tokens;
-            ssd_page_manager->store_checkpoint_with_tokens(
+            const int64_t t_ssd_start = ggml_time_us();
+            double io_ms = 0.0;
+            bool stored = ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur,
                 prefix_tokens.get_tokens().data(),
                 prefix_tokens.get_tokens().size(),
                 ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+                slot.task ? slot.task->user_id : std::string(),
+                &io_ms);
+            const double t_ssd_ms = (ggml_time_us() - t_ssd_start) / 1000.0;
+            if (stored) {
+                note_cache_event(&slot, server_cache_event{
+                    "ssd_store", "disk",
+                    cur.n_tokens, (int64_t) cur.size(), io_ms > 0.0 ? io_ms : t_ssd_ms, "",
+                });
+            }
         }
     }
 
@@ -2766,10 +2839,18 @@ private:
         }
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
+        const int64_t t_ckpt_start = ggml_time_us();
+
         // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
         cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        const double t_ckpt_ms = (ggml_time_us() - t_ckpt_start) / 1000.0;
+        note_cache_event(&slot, server_cache_event{
+            "checkpoint_create", "ram",
+            cur.n_tokens, (int64_t) cur.size(), t_ckpt_ms, "final",
+        });
 
         SLT_INF(slot,
                 "created final context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2781,10 +2862,20 @@ private:
             const auto & prefix_tokens = slot.task
                 ? slot.task->tokens.get_tokens()
                 : slot.prompt.tokens.get_tokens();
-            ssd_page_manager->store_checkpoint_with_tokens(
+            const int64_t t_ssd_start = ggml_time_us();
+            double io_ms = 0.0;
+            bool stored = ssd_page_manager->store_checkpoint_with_tokens(
                 slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
                 prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
-                slot.task ? slot.task->user_id : std::string());
+                slot.task ? slot.task->user_id : std::string(),
+                &io_ms);
+            const double t_ssd_ms = (ggml_time_us() - t_ssd_start) / 1000.0;
+            if (stored) {
+                note_cache_event(&slot, server_cache_event{
+                    "ssd_store", "disk",
+                    cur.n_tokens, (int64_t) cur.size(), io_ms > 0.0 ? io_ms : t_ssd_ms, "final",
+                });
+            }
         }
     }
 
@@ -2846,12 +2937,24 @@ private:
         }
 
         // Store in system prompt cache
-        sys_cache->store((const uint32_t*)tokens.data(), (uint32_t)n_sys,
+        const int64_t t_start = ggml_time_us();
+        bool stored = sys_cache->store((const uint32_t*)tokens.data(), (uint32_t)n_sys,
                          state_data.data(), (size_t)got);
+        const double t_ms = (ggml_time_us() - t_start) / 1000.0;
 
         slot_sys_hash[slot.id] = 1;
         SLT_INF(slot, "stored system prompt cache entry: n_sys=%d, size=%zu bytes\n",
                 n_sys, (size_t)got);
+
+        // Cross-conversation by nature (this cache is shared across all
+        // slots/conversations) -- shared cache-operations.log only, no slot
+        // attribution. See note_cache_event()'s doc comment.
+        if (stored) {
+            note_cache_event(nullptr, server_cache_event{
+                "sys_cache_store", "ram",
+                (int64_t) n_sys, (int64_t) got, t_ms, "",
+            });
+        }
     }
 
     // Called when a slot finishes processing (turn complete).
@@ -2861,7 +2964,18 @@ private:
 
         // Store the final state to SSD
         if (ssd_page_manager && slot.prompt.n_tokens() > 0) {
+            const int64_t t_start = ggml_time_us();
             ssd_page_manager->on_turn_complete(ssd_turn_counter);
+            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+            // Aggregate: on_turn_complete() sweeps every open conversation
+            // cache's tier bookkeeping (hot->warm/warm->cold demotion, ring
+            // buffer eviction of cold checkpoints) in one call -- background/
+            // periodic maintenance, not tied to this specific request, so
+            // this goes to the shared log only (see note_cache_event()).
+            note_cache_event(nullptr, server_cache_event{
+                "ssd_maintenance", "tiered", std::nullopt, std::nullopt, t_ms,
+                "turn=" + std::to_string(ssd_turn_counter),
+            });
         }
 
         // Clean up per-slot state
@@ -3076,6 +3190,12 @@ private:
                         }
                     }
 
+                    note_cache_event(nullptr, server_cache_event{
+                        "slot_save", "disk",
+                        (int64_t) token_count, (int64_t) nwrite, t_save_ms,
+                        "slot=" + std::to_string(id_slot) + " file=" + filename,
+                    });
+
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
@@ -3140,6 +3260,12 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
 
+                    note_cache_event(nullptr, server_cache_event{
+                        "slot_restore", "disk",
+                        (int64_t) token_count, (int64_t) nread, t_restore_ms,
+                        "slot=" + std::to_string(id_slot) + " file=" + filename,
+                    });
+
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
@@ -3172,7 +3298,15 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
+                    const int64_t t_erase_start = ggml_time_us();
                     slot->prompt_clear();
+                    const double t_erase_ms = (ggml_time_us() - t_erase_start) / 1000.0;
+
+                    note_cache_event(nullptr, server_cache_event{
+                        "slot_erase", "ram",
+                        (int64_t) n_erased, std::nullopt, t_erase_ms,
+                        "slot=" + std::to_string(id_slot),
+                    });
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -3437,8 +3571,16 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                const int64_t t_shift_start = ggml_time_us();
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                const double t_shift_ms = (ggml_time_us() - t_shift_start) / 1000.0;
+
+                note_cache_event(&slot, server_cache_event{
+                    "ctx_shift", "ram",
+                    (int64_t) n_discard, std::nullopt, t_shift_ms,
+                    "kept=" + std::to_string(n_keep) + " discarded=" + std::to_string(n_discard),
+                });
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3666,7 +3808,9 @@ private:
                                 float ssd_overlap = 0.0f;
                                 bool ssd_is_continuation = false;
                                 std::vector<uint8_t> ssd_spec_data;
-                                if (ssd_page_manager->find_and_load_checkpoint(
+                                const int64_t t_ssd_restore_start = ggml_time_us();
+                                double ssd_restore_io_ms = 0.0;
+                                bool ssd_restore_ok = ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt, ctx_dft.get(),
                                         (uint32_t)slot.id,
@@ -3674,7 +3818,17 @@ private:
                                         &ssd_spec_data,
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(),
                                         &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
-                                        slot.task->user_id)) {
+                                        slot.task->user_id, &ssd_restore_io_ms);
+                                const double t_ssd_restore_ms = (ggml_time_us() - t_ssd_restore_start) / 1000.0;
+                                if (ssd_restore_ok) {
+                                    note_cache_event(&slot, server_cache_event{
+                                        "ssd_restore", ssd_restore_io_ms > 0.0 ? "cold (disk)" : "hot/warm (ram)",
+                                        (int64_t) ssd_n_tokens, std::nullopt,
+                                        ssd_restore_io_ms > 0.0 ? ssd_restore_io_ms : t_ssd_restore_ms,
+                                        "cold-start",
+                                    });
+                                }
+                                if (ssd_restore_ok) {
                                     // Hybrid model LCP validation. Recurrent state is
                                     // content-dependent - if the LCP is much smaller than
                                     // the checkpoint's n_tokens, the recurrent state beyond
@@ -3786,8 +3940,15 @@ private:
                                     (const uint32_t*)task_tokens.data(), (size_t)n_sys);
 
                                 std::vector<uint8_t> sys_data;
-                                if (sys_cache->load((const uint32_t*)task_tokens.data(),
-                                                    (uint32_t)n_sys, sys_data)) {
+                                const int64_t t_sys_load_start = ggml_time_us();
+                                bool sys_hit = sys_cache->load((const uint32_t*)task_tokens.data(),
+                                                    (uint32_t)n_sys, sys_data);
+                                const double t_sys_load_ms = (ggml_time_us() - t_sys_load_start) / 1000.0;
+                                if (sys_hit) {
+                                    note_cache_event(&slot, server_cache_event{
+                                        "sys_cache_hit", "ram",
+                                        (int64_t) n_sys, (int64_t) sys_data.size(), t_sys_load_ms, "",
+                                    });
                                     // Restore system prompt state from cache
                                     // Match the save flag (PARTIAL_ONLY) used by
                                     // maybe_extract_system_prompt(). The system prompt
@@ -4095,6 +4256,7 @@ private:
                                 std::vector<uint8_t> sys_data;
                                 bool recovered = false;
 
+                                const int64_t t_sys_load_start = ggml_time_us();
                                 if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
                                     if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                         (uint32_t)n_sys, sys_data)) {
@@ -4117,8 +4279,14 @@ private:
                                                 n_sys);
                                     }
                                 }
+                                const double t_sys_load_ms = (ggml_time_us() - t_sys_load_start) / 1000.0;
 
                                 if (recovered) {
+                                    note_cache_event(&slot, server_cache_event{
+                                        "sys_cache_hit", "ram",
+                                        (int64_t) recovered_n_sys, (int64_t) sys_data.size(), t_sys_load_ms,
+                                        "do_reset_fallback",
+                                    });
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
                                             sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
                                         n_past = recovered_n_sys;
