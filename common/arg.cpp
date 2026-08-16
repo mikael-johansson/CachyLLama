@@ -1635,6 +1635,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-ctxcpms", "--ctx-checkpoints-max-size"}, "N",
+        string_format("PER-SLOT byte cap (MiB) on the total size of a slot's context checkpoint ring "
+            "(0 = unlimited, default: %d). Complements --ctx-checkpoints (count cap): both apply "
+            "simultaneously. Set this when checkpoints grow large on long conversations, since "
+            "--ctx-checkpoints alone does not bound total bytes.", params.n_ctx_checkpoints_max_size_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("ctx-checkpoints-max-size must be non-negative");
+            }
+            params.n_ctx_checkpoints_max_size_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS_MAX_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {
