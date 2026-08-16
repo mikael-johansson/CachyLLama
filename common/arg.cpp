@@ -1705,14 +1705,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
    ).set_env("LLAMA_ARG_CACHE_SSD_MAX_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-ssd-hot-ram", "--cache-ssd-hot-ram"}, "N",
-        string_format("hot tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
+        string_format("GLOBAL hot tier RAM budget in MiB, shared across all conversations "
+            "(not a per-conversation cap) for SSD cache (default: auto-size once at startup from "
+            "available RAM, 0=auto)"),
         [](common_params & params, int value) {
             params.cache_ssd_hot_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_HOT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-ssd-warm-ram", "--cache-ssd-warm-ram"}, "N",
-        string_format("warm tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
+        string_format("GLOBAL warm tier RAM budget in MiB, shared across all conversations "
+            "(not a per-conversation cap) for SSD cache (default: auto-size once at startup from "
+            "available RAM, 0=auto)"),
         [](common_params & params, int value) {
             params.cache_ssd_warm_ram_mib = value;
         }
