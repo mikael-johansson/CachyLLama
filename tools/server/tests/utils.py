@@ -123,6 +123,8 @@ class ServerProcess:
     cache_ssd_max_conversations: int | None = None
     cache_ssd_cold_maxsize: int | None = None
     cache_ssd_no_fsync: bool = False
+    cache_ssd_hot_ram: int | None = None
+    cache_ssd_warm_ram: int | None = None
 
     # session variables
     process: subprocess.Popen | None = None
@@ -288,6 +290,10 @@ class ServerProcess:
             server_args.extend(["--cache-ssd-cold-maxsize", self.cache_ssd_cold_maxsize])
         if self.cache_ssd_no_fsync:
             server_args.append("--cache-ssd-no-fsync")
+        if self.cache_ssd_hot_ram is not None:
+            server_args.extend(["--cache-ssd-hot-ram", self.cache_ssd_hot_ram])
+        if self.cache_ssd_warm_ram is not None:
+            server_args.extend(["--cache-ssd-warm-ram", self.cache_ssd_warm_ram])
         if self.gcp_compat:
             env["AIP_MODE"] = "PREDICTION"
 
