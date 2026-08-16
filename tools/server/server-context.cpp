@@ -2077,7 +2077,16 @@ private:
         // Compute conversation hash once from the full task tokens.
         // All checkpoints (mid-prompt and deferred) must use the same
         // hash to prevent splitting checkpoints across conversations.
-        {
+        // get_tokens() asserts on multimodal content (has_mtmd) -- the SSD
+        // checkpoint format has no way to represent image/audio tokens, so
+        // multimodal tasks get no conv identity (0 is the recognized "no
+        // cache" sentinel, e.g. server_context_page_manager::get_or_create_cache()
+        // and the effective_conv != 0 guards in server-context-page-manager.cpp).
+        // slots are reused across unrelated tasks, so this must be set
+        // explicitly rather than left stale from a previous task.
+        if (slot.task->tokens.has_mtmd) {
+            slot.conv_hash = 0;
+        } else {
             const auto & task_tokens = slot.task->tokens.get_tokens();
             size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
             slot.conv_hash = kv_ssd_hash_tokens(
@@ -3078,7 +3087,12 @@ private:
                 cur.pos_min, cur.pos_max, cur.n_tokens,
                 (float)cur.size() / 1024 / 1024);
 
-        if (ssd_page_manager) {
+        // get_tokens() asserts on multimodal content (has_mtmd) -- the SSD
+        // checkpoint format has no way to represent image/audio tokens, so
+        // skip disk-store entirely for multimodal turns (safe degradation:
+        // no SSD-cache benefit for that turn, full reprocessing next time).
+        bool tokens_have_media = slot.task ? slot.task->tokens.has_mtmd : slot.prompt.tokens.has_mtmd;
+        if (ssd_page_manager && !tokens_have_media) {
             const auto & prefix_tokens = slot.task
                 ? slot.task->tokens.get_tokens()
                 : slot.prompt.tokens.get_tokens();
@@ -3117,6 +3131,15 @@ private:
         // Only extract once per slot
         auto it = slot_sys_hash.find(slot.id);
         if (it != slot_sys_hash.end() && it->second != 0) {
+            return;
+        }
+
+        // get_tokens() asserts on multimodal content (has_mtmd); the system
+        // prompt cache has no way to represent image/audio tokens. Skip
+        // extraction for multimodal turns (slot_sys_hash is cleaned up
+        // unconditionally in on_turn_complete(), so leaving it unset here
+        // does not leave stale per-slot state).
+        if (slot.task->tokens.has_mtmd) {
             return;
         }
 
@@ -4031,7 +4054,9 @@ private:
 
                         // cold start: try per-conversation SSD checkpoint restore
                         // Must populate slot.prompt.tokens so get_common_prefix() finds the match
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
+                        // get_tokens() asserts on multimodal content (has_mtmd); skip the SSD
+                        // restore for multimodal turns and fall through to normal reprocessing.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager && !slot.task->tokens.has_mtmd) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             if (!task_tokens.empty()) {
                                 int32_t ssd_pos_min = 0, ssd_pos_max = 0;
@@ -4177,7 +4202,9 @@ private:
                         // Only cold starts (empty slot) need system prompt cache.
                         // Warm slots (n_tokens > 0) already have full context from
                         // the in-memory prompt cache LCP restore or previous turn.
-                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
+                        // get_tokens() asserts on multimodal content (has_mtmd); skip the
+                        // system-prompt-cache restore for multimodal turns.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager && !slot.task->tokens.has_mtmd) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
@@ -4497,7 +4524,9 @@ private:
                             // inserts a few dynamic tokens between the system section and
                             // the first user message, shifting the boundary by tens of
                             // tokens between turns.
-                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
+                            // get_tokens() asserts on multimodal content (has_mtmd); skip this
+                            // warm-restart system-prompt-cache fallback for multimodal turns.
+                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager && !slot.task->tokens.has_mtmd) {
                                 const auto & task_tokens = slot.task->tokens.get_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
                                     llama_model_get_vocab(llama_get_model(ctx_tgt)),
