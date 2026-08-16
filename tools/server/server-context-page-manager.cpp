@@ -7,6 +7,7 @@
 #include "server-context.h"
 #include "server-task.h"
 #include "llama.h"
+#include "host-ram.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -103,6 +104,78 @@ server_context_page_manager::server_context_page_manager(
     if (ssd_cfg.warm_ram_bytes == 0) ssd_cfg.warm_ram_bytes = 1ULL * 1024 * 1024 * 1024;
     if (ssd_cfg.hot_turns == 0) ssd_cfg.hot_turns = 2;
     if (ssd_cfg.warm_turns == 0) ssd_cfg.warm_turns = 4;
+
+    // --------------------------------------------------------------------
+    // Global hot/warm RAM budget (fixes: each conversation's kv_ssd_cache
+    // used to auto-size its OWN hot/warm budget independently, in
+    // kv_ssd_init(), by re-sampling live free RAM at conversation-create
+    // time. With N tracked conversations there was no shared ceiling: the
+    // sum of N independently-sampled ~85%-of-free-RAM budgets could vastly
+    // exceed physical RAM, which is what caused a real OOM-kill. Compute
+    // the budget ONCE, here, and share it across every conversation.
+    //
+    // NOTE ON cfg->auto_size vs cfg->max_hot_bytes: cfg->max_hot_bytes /
+    // max_warm_bytes are never actually 0 as constructed by callers today
+    // (kv_eviction_config defaults max_hot_bytes to 6 MiB and
+    // server-context.cpp's cfg construction always substitutes a non-zero
+    // fallback when the CLI flag is unset) -- so "cfg->max_hot_bytes > 0"
+    // can't distinguish "explicit flag" from "default/auto" the way the
+    // task spec that requested this change assumed. cfg->auto_size is the
+    // signal that already reliably encodes that distinction (false only
+    // when the caller explicitly set one of --cache-ssd-hot-ram /
+    // --cache-ssd-warm-ram; see server-context.cpp), and is used here
+    // instead. See also PR/commit notes for this discrepancy.
+    // --------------------------------------------------------------------
+    if (cfg && !cfg->auto_size) {
+        // Explicit --cache-ssd-hot-ram / --cache-ssd-warm-ram: hard limits,
+        // taken directly as the global budget.
+        hot_max_size_bytes  = ssd_cfg.hot_ram_bytes;
+        warm_max_size_bytes = ssd_cfg.warm_ram_bytes;
+        LOG_INF("SSD cache: global RAM budget hot=%zu MiB warm=%zu MiB "
+                "(explicit --cache-ssd-hot-ram/--cache-ssd-warm-ram, shared across all conversations)\n",
+                hot_max_size_bytes / 1024 / 1024, warm_max_size_bytes / 1024 / 1024);
+    } else {
+        // Default / auto-size case: sample live available RAM exactly once
+        // here (not per-conversation) and apply the same 75%/25% split,
+        // memory_reserve, and MIN_HOT/MIN_WARM floors previously duplicated
+        // per-conversation in kv_ssd_init() (common/kv-ssd-cache.cpp).
+        const float memory_reserve = cfg ? cfg->memory_reserve : 0.15f;
+        size_t avail = common::host_available_ram();
+        size_t usable = (size_t)((double)avail * (1.0 - memory_reserve));
+        hot_max_size_bytes  = (usable * 3) / 4;
+        warm_max_size_bytes = usable / 4;
+        const size_t MIN_HOT  = 512ULL * 1024 * 1024;
+        const size_t MIN_WARM = 256ULL * 1024 * 1024;
+        bool boosted = false;
+        if (hot_max_size_bytes < MIN_HOT) {
+            hot_max_size_bytes = MIN_HOT;
+            boosted = true;
+        }
+        if (warm_max_size_bytes < MIN_WARM) {
+            warm_max_size_bytes = MIN_WARM;
+            boosted = true;
+        }
+        LOG_INF("SSD cache: global RAM budget hot=%zu MiB warm=%zu MiB (avail=%zu MiB, "
+                "shared across all conversations)\n",
+                hot_max_size_bytes / 1024 / 1024, warm_max_size_bytes / 1024 / 1024,
+                avail / 1024 / 1024);
+        if (boosted) {
+            LOG_INF("SSD cache: global RAM budget floors applied (min hot=%zu MiB, min warm=%zu MiB)\n",
+                    MIN_HOT / 1024 / 1024, MIN_WARM / 1024 / 1024);
+        }
+    }
+
+    // Every per-conversation kv_ssd_cache now shares the same, once-computed
+    // global figures instead of each re-sampling live RAM for itself.
+    // auto_size is forced off unconditionally: this is the actual
+    // root-cause removal (kv_ssd_init()'s auto-size branch becomes dead
+    // code, intentionally left in place -- harmless, and a smaller diff).
+    // The per-conversation make_room_hot()/demote_*() local safety valve in
+    // common/kv-ssd-cache.cpp still runs exactly as before, just against an
+    // honestly-shared number instead of a live re-sample.
+    ssd_cfg.auto_size    = false;
+    ssd_cfg.hot_ram_bytes  = hot_max_size_bytes;
+    ssd_cfg.warm_ram_bytes = warm_max_size_bytes;
 
     // Store config for creating per-conversation caches later
     // (save a copy of the config)
@@ -347,6 +420,17 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     // happens after the store so writes never fail due to the cap; the cost
     // is a brief overshoot of the cap until the next store triggers eviction.
     evict_conversations_for_size_locked();
+
+    // Enforce the global hot/warm RAM budget (--cache-ssd-hot-ram /
+    // --cache-ssd-warm-ram, or the once-computed auto-size default). Same
+    // after-the-store placement/tradeoff as the cold-tier cap above: writes
+    // never fail due to the cap, at the cost of a brief overshoot until the
+    // next store triggers eviction. Safe to call with mutex_ already held --
+    // it only locks individual kv_ssd_cache::mutex instances, never mutex_
+    // itself (mutex_ is always acquired before any kv_ssd_cache::mutex,
+    // never the reverse -- see the lock-order note on
+    // evict_conversations_for_ram_locked()).
+    evict_conversations_for_ram_locked();
 
     return true;
 }
@@ -924,6 +1008,133 @@ void server_context_page_manager::evict_conversations_for_size_locked() {
     if (evicted > 0) {
         LOG_INF("SSD cache: --cache-ssd-cold-maxsize enforced (evicted=%zu, total=%zu MiB, cap=%zu MiB)\n",
                 evicted, total / (1024 * 1024), cold_max_size_bytes / (1024 * 1024));
+    }
+}
+
+// =============================================================================
+// Hot/warm tier global RAM cap
+// =============================================================================
+
+size_t server_context_page_manager::compute_hot_total_bytes_locked() const {
+    size_t total = 0;
+    for (const auto& [conv, cache] : conv_caches_) {
+        std::lock_guard<std::mutex> l(cache->mutex);
+        total += cache->hot_bytes;
+    }
+    for (const auto& [uk, cache] : user_caches_) {
+        std::lock_guard<std::mutex> l(cache->mutex);
+        total += cache->hot_bytes;
+    }
+    return total;
+}
+
+size_t server_context_page_manager::compute_warm_total_bytes_locked() const {
+    size_t total = 0;
+    for (const auto& [conv, cache] : conv_caches_) {
+        std::lock_guard<std::mutex> l(cache->mutex);
+        total += cache->warm_bytes;
+    }
+    for (const auto& [uk, cache] : user_caches_) {
+        std::lock_guard<std::mutex> l(cache->mutex);
+        total += cache->warm_bytes;
+    }
+    return total;
+}
+
+void server_context_page_manager::evict_conversations_for_ram_locked() {
+    if (hot_max_size_bytes == 0 && warm_max_size_bytes == 0) return;
+
+    size_t hot_total  = compute_hot_total_bytes_locked();
+    size_t warm_total = compute_warm_total_bytes_locked();
+
+    bool hot_over  = hot_max_size_bytes  != 0 && hot_total  > hot_max_size_bytes;
+    bool warm_over = warm_max_size_bytes != 0 && warm_total > warm_max_size_bytes;
+    if (!hot_over && !warm_over) return;
+
+    // Combined candidate list across both anonymous and user-scoped caches,
+    // same tagging pattern as scan_on_disk_conversations_locked /
+    // evict_conversations_for_size_locked. Unlike the cold-tier cap, this is
+    // in-memory RAM state, so the candidate set is exactly conv_caches_ +
+    // user_caches_ (no on-disk scan needed/possible -- RAM doesn't survive
+    // restarts).
+    struct ram_candidate {
+        uint64_t      key;
+        bool          is_user;
+        kv_ssd_cache* cache;
+        uint64_t      last_active; // max last_access across cache->index; 0 if empty (evict first)
+    };
+    std::vector<ram_candidate> candidates;
+    candidates.reserve(conv_caches_.size() + user_caches_.size());
+
+    auto collect = [&](auto& map, bool is_user) {
+        for (auto& [key, cache_ptr] : map) {
+            kv_ssd_cache* cache = cache_ptr.get();
+            uint64_t last_active = 0;
+            {
+                std::lock_guard<std::mutex> l(cache->mutex);
+                for (const auto& [id, ckpt] : cache->index) {
+                    if (ckpt.last_access > last_active) last_active = ckpt.last_access;
+                }
+            }
+            candidates.push_back({key, is_user, cache, last_active});
+        }
+    };
+    collect(conv_caches_, false);
+    collect(user_caches_, true);
+
+    // Oldest-active-first -- entries with no index at all (last_active == 0)
+    // sort first automatically, matching the "treat as least-recently-used,
+    // evict first" rule.
+    std::sort(candidates.begin(), candidates.end(),
+        [](const ram_candidate& a, const ram_candidate& b) { return a.last_active < b.last_active; });
+
+    size_t evicted = 0;
+    for (const auto& c : candidates) {
+        // Re-check against whichever caps are actually active; a cap of 0
+        // means "no constraint" for that tier only. Recomputed every
+        // iteration since each eviction below frees both tiers together.
+        bool need_more = (hot_max_size_bytes  != 0 && hot_total  > hot_max_size_bytes) ||
+                          (warm_max_size_bytes != 0 && warm_total > warm_max_size_bytes);
+        if (!need_more) break;
+
+        kv_ssd_cache* cache = c.cache;
+        size_t freed_hot = 0, freed_warm = 0;
+        {
+            std::lock_guard<std::mutex> l(cache->mutex);
+
+            for (auto& [id, ckpt] : cache->index) {
+                if (ckpt.tier == KV_TIER_HOT || ckpt.tier == KV_TIER_WARM) {
+                    ckpt.tier = KV_TIER_COLD;
+                }
+            }
+
+            freed_hot  = cache->hot_bytes;
+            freed_warm = cache->warm_bytes;
+            cache->hot_cache.clear();
+            cache->warm_cache.clear();
+            cache->hot_bytes  = 0;
+            cache->warm_bytes = 0;
+        }
+
+        hot_total  = (freed_hot  > hot_total)  ? 0 : hot_total  - freed_hot;
+        warm_total = (freed_warm > warm_total) ? 0 : warm_total - freed_warm;
+        evicted++;
+
+        LOG_WRN("SSD cache: evicted conversation %skey=%016lx from RAM (hot+warm -> cold, %zu MiB freed, "
+                "hot_total=%zu MiB, warm_total=%zu MiB)\n",
+                c.is_user ? "user " : "",
+                (unsigned long)c.key,
+                (freed_hot + freed_warm) / (1024 * 1024),
+                hot_total / (1024 * 1024),
+                warm_total / (1024 * 1024));
+    }
+
+    if (evicted > 0) {
+        LOG_INF("SSD cache: global RAM cap enforced (evicted=%zu, hot_total=%zu MiB (cap=%zu MiB), "
+                "warm_total=%zu MiB (cap=%zu MiB))\n",
+                evicted,
+                hot_total / (1024 * 1024), hot_max_size_bytes / (1024 * 1024),
+                warm_total / (1024 * 1024), warm_max_size_bytes / (1024 * 1024));
     }
 }
 

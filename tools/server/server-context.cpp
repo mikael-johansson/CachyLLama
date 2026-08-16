@@ -1495,10 +1495,20 @@ private:
                 ? (size_t)params_base.cache_ssd_hot_ram_mib * 1024 * 1024 : 6ULL * 1024 * 1024;
             cfg.max_warm_bytes = params_base.cache_ssd_warm_ram_mib > 0
                 ? (size_t)params_base.cache_ssd_warm_ram_mib * 1024 * 1024 : 2ULL * 1024 * 1024;
-            // Explicit RAM caps are hard limits: disable auto-sizing so the per-conversation
-            // cache in common/kv-ssd-cache.cpp does not override these caps with values
-            // derived from sysinfo.freeram at conversation-create time. Both flags unset
-            // (default) keeps auto-sizing on so existing setups are unaffected.
+            // Explicit RAM caps are hard, GLOBAL limits shared across every
+            // conversation (server_context_page_manager computes the actual
+            // shared budget once from cfg.auto_size/max_hot_bytes/
+            // max_warm_bytes in its constructor -- see
+            // server-context-page-manager.cpp). cfg.auto_size is also the
+            // signal that constructor uses to distinguish "explicit flag"
+            // from "default auto-size" (max_hot_bytes/max_warm_bytes are
+            // never actually 0 here, so they can't be used for that). Both
+            // flags unset (default) keeps auto-sizing on: the budget is then
+            // computed once at startup from available RAM instead of once
+            // per conversation, which is the actual bug fix here -- previously
+            // every conversation independently re-sampled live free RAM and
+            // claimed its own ~85% share, so N conversations could together
+            // claim up to N times physical RAM.
             cfg.auto_size = (params_base.cache_ssd_hot_ram_mib == 0 &&
                              params_base.cache_ssd_warm_ram_mib == 0);
             cfg.hot_window_tokens = params_base.cache_ssd_hot_window_tokens;

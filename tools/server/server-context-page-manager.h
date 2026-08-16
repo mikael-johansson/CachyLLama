@@ -212,6 +212,16 @@ public:
     // 0 = unlimited. Default: 0.
     size_t cold_max_size_bytes = 0;
 
+    // Global cap on total hot / warm tier RAM bytes summed across every
+    // conversation's kv_ssd_cache (conv_caches_ + user_caches_). Computed
+    // once at construction time from either the explicit
+    // --cache-ssd-hot-ram/--cache-ssd-warm-ram flags or (default) a single
+    // live host_available_ram() sample, and then shared by every
+    // conversation -- see the constructor and evict_conversations_for_ram_locked().
+    // 0 = unlimited, same convention as cold_max_size_bytes.
+    size_t hot_max_size_bytes = 0;
+    size_t warm_max_size_bytes = 0;
+
     std::unordered_map<uint32_t, stored_checkpoint> checkpoints_; // slot_id -> checkpoint
     size_t max_cross_slot_checkpoints_;
     mutable std::shared_mutex mutex_;
@@ -243,6 +253,28 @@ private:
     // can be evicted. Logs each evicted directory. No-op when cap is 0.
     // Caller must hold mutex_.
     void evict_conversations_for_size_locked();
+
+    // Sum of kv_ssd_cache::hot_bytes / warm_bytes across every tracked
+    // conversation (conv_caches_ + user_caches_). In-memory only -- unlike
+    // the cold-tier accounting, RAM state doesn't survive process restarts,
+    // so there's no on-disk state to additionally scan. Briefly locks each
+    // cache's own std::mutex while reading. Caller must hold mutex_.
+    size_t compute_hot_total_bytes_locked() const;
+    size_t compute_warm_total_bytes_locked() const;
+
+    // Demote whole conversations' hot+warm RAM to cold (oldest-active-first)
+    // until both compute_hot_total_bytes_locked() <= hot_max_size_bytes and
+    // compute_warm_total_bytes_locked() <= warm_max_size_bytes, or no more
+    // conversations can be demoted. A cap of 0 means "no constraint" for
+    // that tier only. Pure RAM-only demotion: no disk I/O, no removal from
+    // conv_caches_/user_caches_/checkpoints_ -- every checkpoint stored in
+    // hot/warm is already durably written to disk synchronously at store
+    // time (see kv_ssd_store in common/kv-ssd-cache.cpp), so clearing the
+    // RAM-backing maps loses nothing; the conversation stays retrievable via
+    // the normal kv_ssd_load disk-restore path, exactly like a conversation
+    // that was always cold. Logs each evicted conversation. No-op when both
+    // caps are 0. Caller must hold mutex_.
+    void evict_conversations_for_ram_locked();
 
     // A conversation or user-scoped cache directory discovered on disk under
     // ssd_base_path_ (anonymous) or ssd_base_path_/u/ (user-scoped). This is
@@ -305,6 +337,20 @@ private:
     // layout is the same hash format as anonymous caches.
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> user_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> user_wrappers_;
+
+    // Test-only access to private members/methods (conv_caches_,
+    // get_or_create_cache, compute_hot_total_bytes_locked,
+    // evict_conversations_for_ram_locked, ...) for
+    // tests/test-ssd-cache-ram-cap.cpp. That test exercises the global
+    // RAM-cap eviction logic directly at the kv_ssd_store()/kv_ssd_cache
+    // level (no llama_context/model available in a standalone test binary,
+    // matching the existing tests/test-ssd-cache-*.cpp pattern), which
+    // requires reaching the per-conversation kv_ssd_cache instances and the
+    // new *_locked() methods that are otherwise private by design (see the
+    // task spec this was implemented against). No production code calls
+    // this; it exists purely so the private methods above stay private
+    // while still being unit-testable.
+    friend struct server_context_page_manager_test_hook;
 };
 
 } // namespace llama
