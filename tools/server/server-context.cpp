@@ -3006,7 +3006,12 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
         // SSD-backed KV cache: store checkpoint on disk
-        if (ssd_page_manager) {
+        // get_tokens() asserts on multimodal content (has_mtmd) -- the SSD
+        // checkpoint format has no way to represent image/audio tokens, so
+        // skip disk-store entirely for multimodal turns (safe degradation:
+        // no SSD-cache benefit for that turn, full reprocessing next time).
+        // Sibling guard to the one in deferred_create_final_checkpoint().
+        if (ssd_page_manager && !slot.prompt.tokens.has_mtmd) {
             const auto & prefix_tokens = slot.prompt.tokens;
             const int64_t t_ssd_start = ggml_time_us();
             double io_ms = 0.0;
