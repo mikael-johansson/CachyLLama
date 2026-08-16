@@ -2695,6 +2695,66 @@ private:
         return true;
     }
 
+    // Total bytes currently held by a slot's context checkpoint ring, used
+    // by enforce_checkpoint_byte_cap() below.
+    static size_t checkpoints_total_bytes(const std::list<common_prompt_checkpoint> & checkpoints) {
+        size_t total = 0;
+        for (const auto & c : checkpoints) {
+            total += c.size();
+        }
+        return total;
+    }
+
+    // Per-slot byte cap on slot.prompt.checkpoints, complementing the
+    // existing count-based cap (params_base.n_ctx_checkpoints) enforced
+    // separately in create_checkpoint()/deferred_create_final_checkpoint().
+    // Each common_prompt_checkpoint holds real serialized KV state
+    // (data_tgt/data_dft/data_spec), so on long conversations near the full
+    // context window a single checkpoint can be many hundred MiB -- the
+    // count cap alone doesn't bound total bytes. This runs *after* the
+    // triggering checkpoint has already been created and logged, tolerating
+    // a brief overshoot rather than blocking the write -- same
+    // after-the-fact enforcement pattern as the SSD cache's global hot/warm
+    // RAM cap and cold-tier byte cap.
+    //
+    // Never evicts down to zero: always keeps at least the checkpoint just
+    // created, so a slot is never left with zero usable checkpoint capacity
+    // (same floor philosophy as the RAM-cap fix's MIN_HOT). If the single
+    // remaining checkpoint's own size already exceeds the cap, the ring
+    // simply overshoots -- this is intentional, not a bug.
+    //
+    // Same "worst = highest pos_min" victim-selection policy as the
+    // count-based eviction above, for consistency -- see the reasoning
+    // comment on create_checkpoint() about why highest pos_min is preferred
+    // for hybrid/recurrent models.
+    void enforce_checkpoint_byte_cap(server_slot & slot) {
+        if (params_base.n_ctx_checkpoints_max_size_mib <= 0) {
+            return;
+        }
+        const size_t max_bytes = (size_t) params_base.n_ctx_checkpoints_max_size_mib * 1024 * 1024;
+
+        while (slot.prompt.checkpoints.size() > 1 &&
+               checkpoints_total_bytes(slot.prompt.checkpoints) > max_bytes) {
+            auto worst = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min > worst->pos_min) worst = it;
+            }
+
+            const uint64_t evict_idx = (uint64_t) std::distance(slot.prompt.checkpoints.begin(), worst) + 1;
+            SLT_WRN(slot, "erasing context checkpoint over byte cap (pos_min = %d, pos_max = %d, "
+                    "n_tokens = %" PRId64 ", size = %.3f MiB, cap = %d MiB)\n",
+                    worst->pos_min, worst->pos_max, worst->n_tokens,
+                    (float) worst->size() / 1024 / 1024, params_base.n_ctx_checkpoints_max_size_mib);
+            note_cache_event(&slot, server_cache_event{
+                "checkpoint_evict", "ram",
+                worst->n_tokens, (int64_t) worst->size(), 0.0,
+                "reason=bytecap pos_min=" + std::to_string(worst->pos_min) + " pos_max=" + std::to_string(worst->pos_max),
+                evict_idx, std::nullopt,
+            });
+            slot.prompt.checkpoints.erase(worst);
+        }
+    }
+
     // Record a cache operation for logging (see REQUEST_LOGGING_SPEC.md's
     // cache-operations design). Always writes to the shared, server-lifetime
     // cache-operations.log via server_cache_log_note() -- a no-op unless
@@ -2958,6 +3018,13 @@ private:
                 });
             }
         }
+
+        // Enforce the per-slot byte cap last, after all uses of `cur` above
+        // (including the SSD store, which reads cur.n_tokens/cur.size()) --
+        // the just-created checkpoint can itself be the eviction victim (it
+        // often has the highest pos_min of the ring), so this must not run
+        // while `cur` is still referenced.
+        enforce_checkpoint_byte_cap(slot);
     }
 
     // Deferred final checkpoint: captures full prompt state after the last
@@ -3032,6 +3099,10 @@ private:
                 });
             }
         }
+
+        // See the matching comment in create_checkpoint(): enforce the
+        // per-slot byte cap last, after all uses of `cur` above.
+        enforce_checkpoint_byte_cap(slot);
     }
 
     // Try to restore the system prompt section from the global SSD KV cache.
